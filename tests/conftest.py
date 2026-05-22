@@ -59,6 +59,10 @@ class StubSensorEntity:
     pass
 
 
+class StubSwitchEntity:
+    pass
+
+
 class StubConfigFlow:
     VERSION = 1
 
@@ -117,6 +121,14 @@ def _install_stubs() -> None:
         SENSOR = "sensor"
         SWITCH = "switch"
 
+    class _DeviceEntryType:
+        SERVICE = "service"
+
+    class _DeviceInfo(dict):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.__dict__.update(kwargs)
+
     mods: dict[str, Any] = {
         "homeassistant": ha,
         "homeassistant.util": ha_util,
@@ -161,6 +173,11 @@ def _install_stubs() -> None:
             "homeassistant.helpers.entity_platform",
             AddConfigEntryEntitiesCallback=type("_CB", (), {}),
         ),
+        "homeassistant.helpers.device_registry": _mod(
+            "homeassistant.helpers.device_registry",
+            DeviceEntryType=_DeviceEntryType,
+            DeviceInfo=_DeviceInfo,
+        ),
         "homeassistant.helpers.entity_registry": _mod(
             "homeassistant.helpers.entity_registry"
         ),
@@ -176,6 +193,10 @@ def _install_stubs() -> None:
         "homeassistant.components.binary_sensor": _mod(
             "homeassistant.components.binary_sensor",
             BinarySensorDeviceClass=_BinaryDC,
+        ),
+        "homeassistant.components.switch": _mod(
+            "homeassistant.components.switch",
+            SwitchEntity=StubSwitchEntity,
         ),
         "homeassistant.components.recorder": _mod(
             "homeassistant.components.recorder"

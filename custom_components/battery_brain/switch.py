@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -25,7 +27,9 @@ async def async_setup_entry(
     async_add_entities([TestModeSwitch(coordinator)])
 
 
-class TestModeSwitch(CoordinatorEntity[BatteryBrainCoordinator]):
+class TestModeSwitch(
+    CoordinatorEntity[BatteryBrainCoordinator], SwitchEntity
+):
     """Switch to activate test mode with accelerated time."""
 
     _attr_has_entity_name = True
@@ -35,6 +39,11 @@ class TestModeSwitch(CoordinatorEntity[BatteryBrainCoordinator]):
     def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{DOMAIN}_test_mode"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, coordinator.config_entry.entry_id)},
+            name="BatteryBrain",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     @property
     def is_on(self) -> bool:

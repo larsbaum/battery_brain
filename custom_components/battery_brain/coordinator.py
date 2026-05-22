@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import timedelta
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
@@ -108,6 +108,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self._test_mode_start_real: float = 0.0
         self._test_mode_start_virtual: float = 0.0
         self._time_factor: int = TEST_MODE_TIME_FACTOR
+        self._debug_logger: Any = None
 
     @property
     def developer_mode(self) -> bool:
@@ -153,12 +154,14 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self.store.set_meta("test_mode_start_real", real_now)
         self.store.set_meta("test_mode_start_virtual", real_now)
         LOGGER.info("Test mode activated (time factor: %dx)", self._time_factor)
+        self._log_test_mode_change(True)
 
     def deactivate_test_mode(self) -> None:
         self._test_mode_active = False
         self.update_interval = timedelta(seconds=COORDINATOR_UPDATE_INTERVAL)
         self.store.set_meta("test_mode_active", False)
         LOGGER.info("Test mode deactivated")
+        self._log_test_mode_change(False)
 
     def _get_now_ts(self) -> float:
         real_now = dt_util.utcnow().timestamp()
@@ -177,6 +180,172 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self.store.set_meta("test_mode_start_virtual", virtual_now)
 
     # ------------------------------------------------------------------
+    # Debug logging (developer mode only)
+    # ------------------------------------------------------------------
+
+    def _init_debug_logger(self) -> None:
+        from .debug_log import DebugLogger
+
+        path = self.hass.config.path(f"{DOMAIN}_debug.jsonl")
+        self._debug_logger = DebugLogger(path)
+        LOGGER.info("Debug log active: %s", path)
+        self._debug_logger.log(
+            {
+                "type": "start",
+                "real_ts": dt_util.utcnow().timestamp(),
+                "real_iso": dt_util.utcnow().isoformat(),
+                "developer_mode": True,
+                "test_mode_active": self._test_mode_active,
+                "time_factor": self._time_factor,
+                "options": dict(self.config_entry.options),
+                "config_data": {
+                    k: v
+                    for k, v in self.config_entry.data.items()
+                    if k != "password"
+                },
+            }
+        )
+
+    def _ts_iso(self, ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    def _log_update(self, data: BatteryBrainData) -> None:
+        if self._debug_logger is None:
+            return
+
+        now_real = dt_util.utcnow().timestamp()
+        now_virtual = self._get_now_ts()
+
+        batteries_snapshot: dict[str, Any] = {}
+        for entity_id, info in data.batteries.items():
+            raw = self.store.get_raw_points(entity_id)
+            recent_vals = [p[1] for p in raw[-10:]] if raw else []
+            batteries_snapshot[entity_id] = {
+                "name": info.name,
+                "value": info.last_value,
+                "category": info.category,
+                "status": info.status,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "is_binary": info.is_binary,
+                "unit": info.unit,
+                "history_days": round(
+                    self.store.get_history_days(
+                        entity_id, now_ts=now_virtual
+                    ),
+                    2,
+                ),
+                "raw_points_count": len(raw),
+                "daily_summaries_count": len(
+                    self.store.get_daily_summaries(entity_id)
+                ),
+                "median_interval_s": self.store.get_median_interval(
+                    entity_id
+                ),
+                "last_update_ts": self.store.get_last_update_ts(entity_id),
+                "recent_values": recent_vals,
+            }
+
+        self._debug_logger.log(
+            {
+                "type": "update",
+                "real_ts": now_real,
+                "real_iso": self._ts_iso(now_real),
+                "virtual_ts": now_virtual,
+                "virtual_iso": self._ts_iso(now_virtual),
+                "test_mode": self._test_mode_active,
+                "time_factor": (
+                    self._time_factor if self._test_mode_active else 1
+                ),
+                "update_interval_s": self.update_interval.total_seconds(),
+                "sensors": {
+                    "normal": len(data.normal),
+                    "warning": len(data.warning),
+                    "critical": len(data.critical),
+                    "total": len(data.batteries),
+                },
+                "batteries": batteries_snapshot,
+            }
+        )
+
+    def _log_state_change(
+        self,
+        entity_id: str,
+        old_state_str: str | None,
+        new_state_str: str,
+        info: BatteryInfo,
+    ) -> None:
+        if self._debug_logger is None:
+            return
+
+        now_real = dt_util.utcnow().timestamp()
+        self._debug_logger.log(
+            {
+                "type": "state_change",
+                "real_ts": now_real,
+                "real_iso": self._ts_iso(now_real),
+                "virtual_ts": self._get_now_ts(),
+                "entity_id": entity_id,
+                "old_state": old_state_str,
+                "new_state": new_state_str,
+                "status": info.status,
+                "category": info.category,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "value": info.last_value,
+            }
+        )
+
+    def _log_classification(
+        self,
+        entity_id: str,
+        old_category: str | None,
+        new_category: str,
+    ) -> None:
+        if self._debug_logger is None:
+            return
+
+        now_real = dt_util.utcnow().timestamp()
+        values = self.store.get_all_values(entity_id)
+        raw = self.store.get_raw_points(entity_id)
+        self._debug_logger.log(
+            {
+                "type": "classification",
+                "real_ts": now_real,
+                "real_iso": self._ts_iso(now_real),
+                "virtual_ts": self._get_now_ts(),
+                "entity_id": entity_id,
+                "old_category": old_category,
+                "new_category": new_category,
+                "history_days": round(
+                    self.store.get_history_days(
+                        entity_id, now_ts=self._get_now_ts()
+                    ),
+                    2,
+                ),
+                "raw_points_count": len(raw),
+                "all_values_count": len(values),
+                "all_values": values,
+            }
+        )
+
+    def _log_test_mode_change(self, active: bool) -> None:
+        if self._debug_logger is None:
+            return
+
+        now_real = dt_util.utcnow().timestamp()
+        self._debug_logger.log(
+            {
+                "type": "test_mode_change",
+                "real_ts": now_real,
+                "real_iso": self._ts_iso(now_real),
+                "virtual_ts": self._get_now_ts(),
+                "active": active,
+                "time_factor": self._time_factor,
+            }
+        )
+
+    # ------------------------------------------------------------------
     # Core update loop
     # ------------------------------------------------------------------
 
@@ -186,6 +355,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             self._store_loaded = True
             if self.developer_mode:
                 self._restore_test_mode()
+                self._init_debug_logger()
 
         if self._test_mode_active:
             self._persist_test_mode_checkpoint()
@@ -201,6 +371,11 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
 
         data = BatteryBrainData(batteries=batteries)
         self._update_state_listeners(set(batteries.keys()))
+
+        self._log_update(data)
+        if self._debug_logger is not None:
+            await self._debug_logger.async_flush(self.hass)
+
         return data
 
     # ------------------------------------------------------------------
@@ -318,6 +493,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 info.category = stored_cat
                 continue
 
+            old_cat = stored_cat
             if info.is_binary:
                 info.category = CATEGORY_BINARY
             elif (
@@ -330,6 +506,9 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 )
             else:
                 info.category = CATEGORY_UNKNOWN_DEFAULT
+
+            if info.category != old_cat:
+                self._log_classification(entity_id, old_cat, info.category)
 
             self.store.set_category(entity_id, info.category, now_ts=now)
 
@@ -517,6 +696,12 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         )
         updated.status = self._derive_single_status(
             entity_id, updated, binary_critical
+        )
+
+        old_state_obj = event.data.get("old_state")
+        old_state_str = old_state_obj.state if old_state_obj else None
+        self._log_state_change(
+            entity_id, old_state_str, new_state.state, updated
         )
 
         self.data.batteries[entity_id] = updated

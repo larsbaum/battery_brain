@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up BatteryBrain",
+        "description": "BatteryBrain automatically discovers all battery entities and monitors their health.",
+        "data": {
+          "developer_mode": "Enable developer mode"
+        },
+        "data_description": {
+          "developer_mode": "Enables a test mode switch that accelerates time by 200x for testing purposes."
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "BatteryBrain is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "BatteryBrain Options",
+        "data": {
+          "scan_battery_level_attr": "Scan for battery_level attributes",
+          "binary_low_is_critical": "Treat binary low-battery as critical",
+          "exclude_entities": "Excluded entities"
+        },
+        "data_description": {
+          "scan_battery_level_attr": "Also monitor entities that expose a battery_level attribute, even without the battery device class.",
+          "binary_low_is_critical": "Mark binary battery sensors as critical instead of warning when they report low.",
+          "exclude_entities": "Select entities to exclude from battery monitoring."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "batteries_normal": {
+        "name": "Batteries Normal"
+      },
+      "batteries_warning": {
+        "name": "Batteries Warning"
+      },
+      "batteries_critical": {
+        "name": "Batteries Critical"
+      },
+      "all_batteries": {
+        "name": "All Batteries"
+      }
+    },
+    "switch": {
+      "test_mode": {
+        "name": "Test Mode"
+      }
+    }
+  }
+}

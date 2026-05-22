@@ -1,0 +1,53 @@
+"""Switch platform for BatteryBrain (developer test mode)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from . import BatteryBrainConfigEntry
+from .const import DOMAIN, TEST_MODE_TIME_FACTOR
+from .coordinator import BatteryBrainCoordinator
+
+PARALLEL_UPDATES = 0
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: BatteryBrainConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up BatteryBrain switch entities."""
+    coordinator = entry.runtime_data
+    async_add_entities([TestModeSwitch(coordinator)])
+
+
+class TestModeSwitch(CoordinatorEntity[BatteryBrainCoordinator]):
+    """Switch to activate test mode with accelerated time."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "test_mode"
+    _attr_icon = "mdi:fast-forward"
+
+    def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{DOMAIN}_test_mode"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.test_mode_active
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"time_factor": TEST_MODE_TIME_FACTOR}
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self.coordinator.activate_test_mode()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self.coordinator.deactivate_test_mode()
+        self.async_write_ha_state()

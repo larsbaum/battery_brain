@@ -1,0 +1,481 @@
+"""DataUpdateCoordinator for BatteryBrain."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any
+
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    ATTR_DEVICE_CLASS,
+    ATTR_FRIENDLY_NAME,
+    ATTR_UNIT_OF_MEASUREMENT,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
+
+from .analysis import check_stale, classify_battery, derive_status
+from .const import (
+    CATEGORY_BINARY,
+    CATEGORY_RECLASSIFY_INTERVAL,
+    CATEGORY_UNKNOWN_DEFAULT,
+    CONF_DEVELOPER_MODE,
+    CONFIDENCE_DEFAULT,
+    CONFIDENCE_HIGH,
+    CONFIDENCE_LOW,
+    CONFIDENCE_MEDIUM,
+    COORDINATOR_UPDATE_INTERVAL,
+    DOMAIN,
+    LOGGER,
+    LOW_CONFIDENCE_DAYS,
+    MEDIUM_CONFIDENCE_DAYS,
+    MIN_HISTORY_DAYS,
+    OPT_BINARY_LOW_IS_CRITICAL,
+    OPT_EXCLUDE_ENTITIES,
+    OPT_SCAN_BATTERY_LEVEL_ATTR,
+    STATUS_CRITICAL,
+    STATUS_NORMAL,
+    STATUS_WARNING,
+    TEST_MODE_TIME_FACTOR,
+)
+from .storage import BatteryHistoryStore, async_seed_from_recorder
+
+
+@dataclass
+class BatteryInfo:
+    """Tracked state for a single battery."""
+
+    name: str
+    source_entity: str
+    category: str = CATEGORY_UNKNOWN_DEFAULT
+    status: str = STATUS_NORMAL
+    last_value: float | str | None = None
+    confidence: str = CONFIDENCE_DEFAULT
+    stale: bool = False
+    is_binary: bool = False
+    unit: str | None = None
+
+
+@dataclass
+class BatteryBrainData:
+    """Aggregated data returned by the coordinator."""
+
+    batteries: dict[str, BatteryInfo] = field(default_factory=dict)
+
+    @property
+    def normal(self) -> list[BatteryInfo]:
+        return [b for b in self.batteries.values() if b.status == STATUS_NORMAL]
+
+    @property
+    def warning(self) -> list[BatteryInfo]:
+        return [b for b in self.batteries.values() if b.status == STATUS_WARNING]
+
+    @property
+    def critical(self) -> list[BatteryInfo]:
+        return [
+            b for b in self.batteries.values() if b.status == STATUS_CRITICAL
+        ]
+
+
+class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
+    """Discover battery entities, classify, and compute health status."""
+
+    config_entry: ConfigEntry
+
+    def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+        super().__init__(
+            hass,
+            LOGGER,
+            name=DOMAIN,
+            config_entry=config_entry,
+            update_interval=timedelta(seconds=COORDINATOR_UPDATE_INTERVAL),
+        )
+        self._tracked_entities: set[str] = set()
+        self._unsub_state_listener: callback | None = None
+        self.store = BatteryHistoryStore(hass)
+        self._store_loaded = False
+        self._last_aggregation: float = 0.0
+
+        self._test_mode_active = False
+        self._test_mode_start_real: float = 0.0
+        self._test_mode_start_virtual: float = 0.0
+        self._time_factor: int = TEST_MODE_TIME_FACTOR
+
+    @property
+    def developer_mode(self) -> bool:
+        return bool(self.config_entry.data.get(CONF_DEVELOPER_MODE, False))
+
+    @property
+    def test_mode_active(self) -> bool:
+        return self._test_mode_active
+
+    def activate_test_mode(self) -> None:
+        real_now = dt_util.utcnow().timestamp()
+        self._test_mode_start_real = real_now
+        self._test_mode_start_virtual = real_now
+        self._test_mode_active = True
+        self.update_interval = timedelta(
+            seconds=COORDINATOR_UPDATE_INTERVAL / self._time_factor
+        )
+        LOGGER.info("Test mode activated (time factor: %dx)", self._time_factor)
+
+    def deactivate_test_mode(self) -> None:
+        self._test_mode_active = False
+        self.update_interval = timedelta(seconds=COORDINATOR_UPDATE_INTERVAL)
+        LOGGER.info("Test mode deactivated")
+
+    def _get_now_ts(self) -> float:
+        real_now = dt_util.utcnow().timestamp()
+        if not self._test_mode_active:
+            return real_now
+        elapsed = real_now - self._test_mode_start_real
+        return self._test_mode_start_virtual + elapsed * self._time_factor
+
+    # ------------------------------------------------------------------
+    # Core update loop
+    # ------------------------------------------------------------------
+
+    async def _async_update_data(self) -> BatteryBrainData:
+        if not self._store_loaded:
+            await self.store.async_load()
+            self._store_loaded = True
+
+        batteries = self._discover_batteries()
+        await self._seed_new_batteries(batteries)
+        self._record_current_values(batteries)
+        self._classify_batteries(batteries)
+        self._derive_all_status(batteries)
+        self._apply_stale_overlay(batteries)
+        self._update_confidence(batteries)
+        self._maybe_aggregate()
+
+        data = BatteryBrainData(batteries=batteries)
+        self._update_state_listeners(set(batteries.keys()))
+        return data
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    def _discover_batteries(self) -> dict[str, BatteryInfo]:
+        exclude = set(
+            self.config_entry.options.get(OPT_EXCLUDE_ENTITIES, [])
+        )
+        scan_attr = self.config_entry.options.get(
+            OPT_SCAN_BATTERY_LEVEL_ATTR, False
+        )
+        batteries: dict[str, BatteryInfo] = {}
+
+        for state in self.hass.states.async_all("sensor"):
+            if state.entity_id in exclude:
+                continue
+            if (
+                state.attributes.get(ATTR_DEVICE_CLASS)
+                == SensorDeviceClass.BATTERY
+            ):
+                batteries[state.entity_id] = self._build_battery_info(
+                    state.entity_id, state.state, state.attributes
+                )
+
+        for state in self.hass.states.async_all("binary_sensor"):
+            if state.entity_id in exclude:
+                continue
+            if (
+                state.attributes.get(ATTR_DEVICE_CLASS)
+                == BinarySensorDeviceClass.BATTERY
+            ):
+                batteries[state.entity_id] = self._build_battery_info(
+                    state.entity_id,
+                    state.state,
+                    state.attributes,
+                    is_binary=True,
+                )
+
+        if scan_attr:
+            for domain in ("sensor", "binary_sensor", "device_tracker"):
+                for state in self.hass.states.async_all(domain):
+                    if state.entity_id in exclude:
+                        continue
+                    if state.entity_id in batteries:
+                        continue
+                    if "battery_level" in state.attributes:
+                        batteries[state.entity_id] = self._build_battery_info(
+                            state.entity_id,
+                            str(state.attributes["battery_level"]),
+                            state.attributes,
+                        )
+
+        return batteries
+
+    def _build_battery_info(
+        self,
+        entity_id: str,
+        state_value: str,
+        attributes: dict[str, Any],
+        *,
+        is_binary: bool = False,
+    ) -> BatteryInfo:
+        name = attributes.get(ATTR_FRIENDLY_NAME, entity_id)
+        unit = attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+
+        if state_value in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            last_value: float | str | None = None
+        elif is_binary:
+            last_value = state_value
+        else:
+            last_value = self._try_float(state_value)
+
+        return BatteryInfo(
+            name=name,
+            source_entity=entity_id,
+            category=CATEGORY_BINARY if is_binary else CATEGORY_UNKNOWN_DEFAULT,
+            status=STATUS_NORMAL,
+            last_value=last_value,
+            confidence=CONFIDENCE_DEFAULT,
+            stale=False,
+            is_binary=is_binary,
+            unit=unit,
+        )
+
+    @staticmethod
+    def _try_float(value: str) -> float | str | None:
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return value if value else None
+
+    # ------------------------------------------------------------------
+    # Classification
+    # ------------------------------------------------------------------
+
+    def _classify_batteries(
+        self, batteries: dict[str, BatteryInfo]
+    ) -> None:
+        now = self._get_now_ts()
+        reclassify_interval = CATEGORY_RECLASSIFY_INTERVAL
+        if self._test_mode_active:
+            reclassify_interval /= self._time_factor
+
+        for entity_id, info in batteries.items():
+            stored_cat = self.store.get_category(entity_id)
+            last_classified = self.store.get_last_classified(entity_id)
+
+            if (
+                stored_cat
+                and last_classified
+                and (now - last_classified) < reclassify_interval
+            ):
+                info.category = stored_cat
+                continue
+
+            if info.is_binary:
+                info.category = CATEGORY_BINARY
+            elif (
+                self.store.get_history_days(entity_id, now_ts=now)
+                >= MIN_HISTORY_DAYS
+            ):
+                values = self.store.get_all_values(entity_id)
+                info.category = classify_battery(
+                    values, is_binary=False, unit=info.unit
+                )
+            else:
+                info.category = CATEGORY_UNKNOWN_DEFAULT
+
+            self.store.set_category(entity_id, info.category, now_ts=now)
+
+    # ------------------------------------------------------------------
+    # Status derivation
+    # ------------------------------------------------------------------
+
+    def _derive_all_status(
+        self, batteries: dict[str, BatteryInfo]
+    ) -> None:
+        binary_critical = self.config_entry.options.get(
+            OPT_BINARY_LOW_IS_CRITICAL, False
+        )
+        for entity_id, info in batteries.items():
+            info.status = self._derive_single_status(
+                entity_id, info, binary_critical
+            )
+
+    def _derive_single_status(
+        self,
+        entity_id: str,
+        info: BatteryInfo,
+        binary_critical: bool,
+    ) -> str:
+        values = self.store.get_all_values(entity_id)
+        raw_points = self.store.get_raw_points(entity_id)
+        return derive_status(
+            info.category,
+            info.last_value,
+            values,
+            raw_points,
+            is_binary=info.is_binary,
+            binary_low_is_critical=binary_critical,
+            now_ts=self._get_now_ts(),
+        )
+
+    # ------------------------------------------------------------------
+    # Stale overlay
+    # ------------------------------------------------------------------
+
+    def _apply_stale_overlay(
+        self, batteries: dict[str, BatteryInfo]
+    ) -> None:
+        now = self._get_now_ts()
+        for entity_id, info in batteries.items():
+            last_ts = self.store.get_last_update_ts(entity_id)
+            median_iv = self.store.get_median_interval(entity_id)
+            info.stale = check_stale(
+                last_update_ts=last_ts,
+                median_interval=median_iv,
+                value_is_unavailable=info.last_value is None,
+                now_ts=now,
+            )
+            if info.stale:
+                info.status = STATUS_CRITICAL
+
+    # ------------------------------------------------------------------
+    # History integration
+    # ------------------------------------------------------------------
+
+    async def _seed_new_batteries(
+        self, batteries: dict[str, BatteryInfo]
+    ) -> None:
+        for entity_id, info in batteries.items():
+            if self.store.is_seeded(entity_id):
+                continue
+            try:
+                await async_seed_from_recorder(
+                    self.hass,
+                    self.store,
+                    entity_id,
+                    is_binary=info.is_binary,
+                )
+            except Exception:
+                LOGGER.warning(
+                    "Failed to seed history for %s",
+                    entity_id,
+                    exc_info=True,
+                )
+                self.store.mark_seeded(entity_id)
+
+    def _record_current_values(
+        self, batteries: dict[str, BatteryInfo]
+    ) -> None:
+        now = self._get_now_ts()
+        for entity_id, info in batteries.items():
+            if info.last_value is None:
+                continue
+            if info.is_binary:
+                val = 1.0 if info.last_value == STATE_ON else 0.0
+            elif isinstance(info.last_value, (int, float)):
+                val = float(info.last_value)
+            else:
+                continue
+            self.store.add_point(entity_id, now, val)
+
+    def _update_confidence(
+        self, batteries: dict[str, BatteryInfo]
+    ) -> None:
+        now = self._get_now_ts()
+        for entity_id, info in batteries.items():
+            days = self.store.get_history_days(entity_id, now_ts=now)
+            if days < MIN_HISTORY_DAYS:
+                info.confidence = CONFIDENCE_DEFAULT
+            elif days < LOW_CONFIDENCE_DAYS:
+                info.confidence = CONFIDENCE_LOW
+            elif days < MEDIUM_CONFIDENCE_DAYS:
+                info.confidence = CONFIDENCE_MEDIUM
+            else:
+                info.confidence = CONFIDENCE_HIGH
+
+    def _maybe_aggregate(self) -> None:
+        now = self._get_now_ts()
+        agg_interval = 86400
+        if self._test_mode_active:
+            agg_interval /= self._time_factor
+        if now - self._last_aggregation > agg_interval:
+            self.store.aggregate(now_ts=now)
+            self._last_aggregation = now
+
+    # ------------------------------------------------------------------
+    # State-change listener
+    # ------------------------------------------------------------------
+
+    @callback
+    def _update_state_listeners(self, current_entities: set[str]) -> None:
+        if current_entities == self._tracked_entities:
+            return
+
+        if self._unsub_state_listener is not None:
+            self._unsub_state_listener()
+            self._unsub_state_listener = None
+
+        if current_entities:
+            self._unsub_state_listener = async_track_state_change_event(
+                self.hass,
+                list(current_entities),
+                self._handle_battery_state_change,
+            )
+            self.config_entry.async_on_unload(
+                lambda: (
+                    self._unsub_state_listener()
+                    if self._unsub_state_listener
+                    else None
+                )
+            )
+
+        self._tracked_entities = current_entities
+
+    @callback
+    def _handle_battery_state_change(self, event: Event) -> None:
+        entity_id = event.data.get("entity_id")
+        new_state = event.data.get("new_state")
+        if entity_id is None or new_state is None or self.data is None:
+            return
+
+        if entity_id not in self.data.batteries:
+            return
+
+        existing = self.data.batteries[entity_id]
+
+        if new_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            now = self._get_now_ts()
+            if existing.is_binary:
+                val = 1.0 if new_state.state == STATE_ON else 0.0
+            else:
+                try:
+                    val = float(new_state.state)
+                except (ValueError, TypeError):
+                    val = None
+            if val is not None:
+                self.store.add_point(entity_id, now, val)
+
+        updated = self._build_battery_info(
+            entity_id,
+            new_state.state,
+            new_state.attributes,
+            is_binary=existing.is_binary,
+        )
+        updated.category = existing.category
+        updated.confidence = existing.confidence
+
+        binary_critical = self.config_entry.options.get(
+            OPT_BINARY_LOW_IS_CRITICAL, False
+        )
+        updated.status = self._derive_single_status(
+            entity_id, updated, binary_critical
+        )
+
+        self.data.batteries[entity_id] = updated
+        self.async_set_updated_data(self.data)

@@ -117,6 +117,30 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
     def test_mode_active(self) -> bool:
         return self._test_mode_active
 
+    def _restore_test_mode(self) -> None:
+        """Restore test mode state from persistent storage after restart."""
+        if not self.store.get_meta("test_mode_active", False):
+            return
+        saved_real = self.store.get_meta("test_mode_start_real", 0.0)
+        saved_virtual = self.store.get_meta("test_mode_start_virtual", 0.0)
+        if not saved_real or not saved_virtual:
+            return
+        real_now = dt_util.utcnow().timestamp()
+        elapsed_while_off = real_now - saved_real
+        self._test_mode_start_real = real_now
+        self._test_mode_start_virtual = (
+            saved_virtual + elapsed_while_off * self._time_factor
+        )
+        self._test_mode_active = True
+        self.update_interval = timedelta(
+            seconds=COORDINATOR_UPDATE_INTERVAL / self._time_factor
+        )
+        LOGGER.info(
+            "Test mode restored (time factor: %dx, virtual time advanced by %.1f days while offline)",
+            self._time_factor,
+            elapsed_while_off * self._time_factor / 86400,
+        )
+
     def activate_test_mode(self) -> None:
         real_now = dt_util.utcnow().timestamp()
         self._test_mode_start_real = real_now
@@ -125,11 +149,15 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self.update_interval = timedelta(
             seconds=COORDINATOR_UPDATE_INTERVAL / self._time_factor
         )
+        self.store.set_meta("test_mode_active", True)
+        self.store.set_meta("test_mode_start_real", real_now)
+        self.store.set_meta("test_mode_start_virtual", real_now)
         LOGGER.info("Test mode activated (time factor: %dx)", self._time_factor)
 
     def deactivate_test_mode(self) -> None:
         self._test_mode_active = False
         self.update_interval = timedelta(seconds=COORDINATOR_UPDATE_INTERVAL)
+        self.store.set_meta("test_mode_active", False)
         LOGGER.info("Test mode deactivated")
 
     def _get_now_ts(self) -> float:
@@ -139,6 +167,15 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         elapsed = real_now - self._test_mode_start_real
         return self._test_mode_start_virtual + elapsed * self._time_factor
 
+    def _persist_test_mode_checkpoint(self) -> None:
+        """Save current virtual time anchor so restarts can resume."""
+        real_now = dt_util.utcnow().timestamp()
+        virtual_now = self._get_now_ts()
+        self._test_mode_start_real = real_now
+        self._test_mode_start_virtual = virtual_now
+        self.store.set_meta("test_mode_start_real", real_now)
+        self.store.set_meta("test_mode_start_virtual", virtual_now)
+
     # ------------------------------------------------------------------
     # Core update loop
     # ------------------------------------------------------------------
@@ -147,6 +184,11 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         if not self._store_loaded:
             await self.store.async_load()
             self._store_loaded = True
+            if self.developer_mode:
+                self._restore_test_mode()
+
+        if self._test_mode_active:
+            self._persist_test_mode_checkpoint()
 
         batteries = self._discover_batteries()
         await self._seed_new_batteries(batteries)

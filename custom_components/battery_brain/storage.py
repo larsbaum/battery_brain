@@ -31,14 +31,17 @@ class BatteryHistoryStore:
             hass, STORAGE_VERSION, STORAGE_KEY
         )
         self._data: dict[str, dict[str, Any]] = {}
+        self._meta: dict[str, Any] = {}
 
     async def async_load(self) -> None:
         """Load stored history from .storage/."""
         stored = await self._store.async_load()
         if stored and isinstance(stored, dict):
             self._data = stored.get("batteries", {})
+            self._meta = stored.get("meta", {})
         else:
             self._data = {}
+            self._meta = {}
 
     def _schedule_save(self) -> None:
         self._store.async_delay_save(self._serialize, SAVE_DELAY)
@@ -48,7 +51,16 @@ class BatteryHistoryStore:
         await self._store.async_save(self._serialize())
 
     def _serialize(self) -> dict[str, Any]:
-        return {"batteries": self._data}
+        return {"batteries": self._data, "meta": self._meta}
+
+    # --- Global meta (test mode state, etc.) ---
+
+    def get_meta(self, key: str, default: Any = None) -> Any:
+        return self._meta.get(key, default)
+
+    def set_meta(self, key: str, value: Any) -> None:
+        self._meta[key] = value
+        self._schedule_save()
 
     # --- Query helpers ---
 

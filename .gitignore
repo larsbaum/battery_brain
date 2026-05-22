@@ -38,3 +38,6 @@ htmlcov/
 
 # Home Assistant
 .storage/
+
+# Test batteries (local dev only, not part of BatteryBrain)
+test_batteries/

@@ -144,13 +144,32 @@ def _is_rechargeable(values: list[float]) -> bool:
 
 
 def _is_low_stable(values: list[float]) -> bool:
-    """Median below 30 % with low variance."""
+    """Persistently low and stable.
+
+    Matches if either:
+    - The whole history is low + stable, OR
+    - The recent tail (last ~60 samples) is low + stable. This catches
+      batteries that were once high but have settled at a low value for
+      a long time — e.g. a button that has been at 1 % for months.
+    """
     if len(values) < 5:
         return False
 
+    if _stable_low(values):
+        return True
+
+    # Recent tail: at least 30 samples, last min(60, len) values
+    tail_len = min(60, len(values))
+    if tail_len >= 30 and _stable_low(values[-tail_len:]):
+        return True
+
+    return False
+
+
+def _stable_low(values: list[float]) -> bool:
+    """Median < 30 and standard deviation < 10."""
     if _median(values) >= 30:
         return False
-
     mean_val = sum(values) / len(values)
     variance = sum((v - mean_val) ** 2 for v in values) / len(values)
     return variance**0.5 < 10

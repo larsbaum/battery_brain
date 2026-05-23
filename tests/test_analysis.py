@@ -142,6 +142,19 @@ class TestClassifyLowStable:
         vals = [5, 25, 5, 28, 3, 20, 5, 25]
         assert classify_battery(vals) != CATEGORY_LOW_STABLE
 
+    def test_stuck_at_low_after_decline(self):
+        # Battery dropped from 100 % over time and has been stuck at 1 %
+        # for many readings — should now be low_stable, not unknown.
+        # 20 declining (full history fails the variance check) +
+        # 60 stable at 1 % (the tail tail passes).
+        vals = list(range(100, 0, -5)) + [1.0] * 60
+        assert classify_battery(vals) == CATEGORY_LOW_STABLE
+
+    def test_recent_decline_not_yet_stable(self):
+        # Just dropped — recent values not yet stable enough
+        vals = [80, 70, 60, 50, 40, 30, 20, 10, 5, 2]
+        assert classify_battery(vals) != CATEGORY_LOW_STABLE
+
 
 class TestClassifyPlateauCliff:
     def test_classic_plateau_then_cliff(self):
@@ -519,12 +532,12 @@ class TestCheckStale:
         last = NOW_TS - 12 * 3600  # 12h ago
         assert check_stale(last, median, False, now_ts=NOW_TS) is False
 
-    def test_unavailable_stale_after_6h(self):
+    def test_unavailable_stale_after_threshold(self):
         last = NOW_TS - (STALE_UNAVAILABLE_HOURS * 3600 + 1)
         assert check_stale(last, None, True, now_ts=NOW_TS) is True
 
-    def test_unavailable_not_stale_under_6h(self):
-        last = NOW_TS - 3 * 3600  # 3h ago
+    def test_unavailable_not_stale_under_threshold(self):
+        last = NOW_TS - (STALE_UNAVAILABLE_HOURS * 3600 - 60)
         assert check_stale(last, None, True, now_ts=NOW_TS) is False
 
     def test_stale_without_median_uses_24h(self):

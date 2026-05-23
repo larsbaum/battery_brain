@@ -148,6 +148,11 @@ def _install_stubs() -> None:
             HomeAssistant=type("HomeAssistant", (), {}),
             Event=type("Event", (), {}),
             callback=_noop_decorator,
+            CoreState=type(
+                "CoreState",
+                (),
+                {"running": "running", "starting": "starting"},
+            ),
         ),
         "homeassistant.config_entries": _mod(
             "homeassistant.config_entries",
@@ -163,6 +168,10 @@ def _install_stubs() -> None:
         "homeassistant.helpers.event": _mod(
             "homeassistant.helpers.event",
             async_track_state_change_event=lambda *a, **k: (lambda: None),
+        ),
+        "homeassistant.helpers.start": _mod(
+            "homeassistant.helpers.start",
+            async_at_started=lambda hass, cb: (lambda: None),
         ),
         "homeassistant.helpers.update_coordinator": _mod(
             "homeassistant.helpers.update_coordinator",

@@ -41,7 +41,7 @@ class TestModeSwitch(
         self._attr_unique_id = f"{DOMAIN}_test_mode"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.config_entry.entry_id)},
-            name="BatteryBrain",
+            name="Battery Brain",
             entry_type=DeviceEntryType.SERVICE,
         )
 

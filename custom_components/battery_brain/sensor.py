@@ -46,7 +46,7 @@ class BatteryBrainSensor(CoordinatorEntity[BatteryBrainCoordinator], SensorEntit
         super().__init__(coordinator)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.config_entry.entry_id)},
-            name="BatteryBrain",
+            name="Battery Brain",
             entry_type=DeviceEntryType.SERVICE,
         )
 
@@ -63,7 +63,7 @@ class BatteriesNormalSensor(BatteryBrainSensor):
 
     def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_normal"
+        self._attr_unique_id = f"{DOMAIN}_batteries_normal"
 
     @property
     def native_value(self) -> int:
@@ -92,7 +92,7 @@ class BatteriesWarningSensor(BatteryBrainSensor):
 
     def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_warning"
+        self._attr_unique_id = f"{DOMAIN}_batteries_warning"
 
     @property
     def native_value(self) -> int:
@@ -121,7 +121,7 @@ class BatteriesCriticalSensor(BatteryBrainSensor):
 
     def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_critical"
+        self._attr_unique_id = f"{DOMAIN}_batteries_critical"
 
     @property
     def native_value(self) -> int:
@@ -150,7 +150,7 @@ class AllBatteriesSensor(BatteryBrainSensor):
 
     def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
         super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_all"
+        self._attr_unique_id = f"{DOMAIN}_all_batteries"
 
     @property
     def native_value(self) -> int:

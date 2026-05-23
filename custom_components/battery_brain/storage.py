@@ -194,12 +194,17 @@ class BatteryHistoryStore:
 
     # --- Mutation ---
 
-    def _ensure_battery(self, entity_id: str) -> dict[str, Any]:
+    def _ensure_battery(
+        self, entity_id: str, now_ts: float | None = None
+    ) -> dict[str, Any]:
         if entity_id not in self._data:
+            # Use the provided timestamp (virtual in test mode) so that
+            # get_history_days() correctly computes virtual elapsed days.
+            ts = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
             self._data[entity_id] = {
                 "raw_points": [],
                 "daily_summaries": [],
-                "first_seen": dt_util.utcnow().timestamp(),
+                "first_seen": ts,
                 "seeded": False,
             }
         return self._data[entity_id]
@@ -210,7 +215,7 @@ class BatteryHistoryStore:
         """Append a single data point (deduplicates by timestamp)."""
         if value is None:
             return
-        data = self._ensure_battery(entity_id)
+        data = self._ensure_battery(entity_id, now_ts=timestamp)
         raw = data["raw_points"]
         if raw and raw[-1][0] >= timestamp:
             return

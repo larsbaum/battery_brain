@@ -74,21 +74,50 @@ def _is_voltage(values: list[float], unit: str | None) -> bool:
 
 
 def _is_rechargeable(values: list[float]) -> bool:
-    """Two or more charge events (cumulative rise ≥ 10 pp after a trough)."""
+    """Two or more *gradual* charge events after troughs.
+
+    Key distinction vs battery replacement:
+    - Rechargeable device: value rises slowly over multiple steps (e.g. +5 pp/tick)
+    - Battery replacement: value jumps in a single step (e.g. +70 pp at once)
+
+    A step larger than MAX_SINGLE_STEP is treated as a replacement event and
+    resets the tracking — it does NOT count toward a charge event.
+    """
     if len(values) < 10:
         return False
 
+    _MIN_CUMULATIVE_RISE = 15.0   # total rise needed to count as one charge cycle
+    _MAX_SINGLE_STEP = 30.0       # above this → battery replacement, not charging
+    _MIN_STEPS = 3                # minimum rising steps needed (ensures gradual rise)
+
     charge_events = 0
-    min_cumulative_rise = 10.0
     trough: float | None = None
+    cumulative_rise = 0.0
+    step_count = 0
 
     for i in range(1, len(values)):
-        if values[i] < values[i - 1] - 1:
+        delta = values[i] - values[i - 1]
+
+        if delta < -1.0:
+            # Falling — track lowest trough; reset any in-progress charge tracking
             if trough is None or values[i] < trough:
                 trough = values[i]
-        elif trough is not None and values[i] - trough >= min_cumulative_rise:
-            charge_events += 1
+            cumulative_rise = 0.0
+            step_count = 0
+        elif delta > _MAX_SINGLE_STEP:
+            # Single large jump → battery replacement, not a charge event
             trough = None
+            cumulative_rise = 0.0
+            step_count = 0
+        elif delta > 0.5 and trough is not None:
+            # Gradual rising step after a trough
+            cumulative_rise += delta
+            step_count += 1
+            if cumulative_rise >= _MIN_CUMULATIVE_RISE and step_count >= _MIN_STEPS:
+                charge_events += 1
+                trough = None
+                cumulative_rise = 0.0
+                step_count = 0
 
     return charge_events >= 2
 

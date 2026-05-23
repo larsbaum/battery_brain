@@ -402,6 +402,26 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                     state.entity_id, state.state, state.attributes
                 )
 
+        # Also discover sensors with device_class: voltage in battery voltage range.
+        # Some integrations (e.g. custom components) report battery voltage using the
+        # voltage device class instead of the battery device class.
+        for state in self.hass.states.async_all("sensor"):
+            if state.entity_id in exclude or state.entity_id in batteries:
+                continue
+            if (
+                state.attributes.get(ATTR_DEVICE_CLASS)
+                == SensorDeviceClass.VOLTAGE
+            ):
+                try:
+                    val = float(state.state)
+                except (ValueError, TypeError):
+                    continue
+                # Filter: only battery-range voltages (0.3–20 V), not mains voltage
+                if 0.3 < val <= 20.0:
+                    batteries[state.entity_id] = self._build_battery_info(
+                        state.entity_id, state.state, state.attributes
+                    )
+
         for state in self.hass.states.async_all("binary_sensor"):
             if state.entity_id in exclude:
                 continue

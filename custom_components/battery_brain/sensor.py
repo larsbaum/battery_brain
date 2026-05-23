@@ -70,8 +70,18 @@ class BatteriesNormalSensor(BatteryBrainSensor):
         return len(self._data.normal)
 
     @property
-    def extra_state_attributes(self) -> dict[str, list[str]]:
-        return {"batteries": [b.name for b in self._data.normal]}
+    def extra_state_attributes(self) -> dict[str, dict]:
+        attrs: dict[str, dict] = {}
+        for info in self._data.normal:
+            attrs[info.name] = {
+                "category": info.category,
+                "status": info.status,
+                "last_value": info.last_value,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "source_entity": info.source_entity,
+            }
+        return attrs
 
 
 class BatteriesWarningSensor(BatteryBrainSensor):
@@ -89,8 +99,18 @@ class BatteriesWarningSensor(BatteryBrainSensor):
         return len(self._data.warning)
 
     @property
-    def extra_state_attributes(self) -> dict[str, list[str]]:
-        return {"batteries": [b.name for b in self._data.warning]}
+    def extra_state_attributes(self) -> dict[str, dict]:
+        attrs: dict[str, dict] = {}
+        for info in self._data.warning:
+            attrs[info.name] = {
+                "category": info.category,
+                "status": info.status,
+                "last_value": info.last_value,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "source_entity": info.source_entity,
+            }
+        return attrs
 
 
 class BatteriesCriticalSensor(BatteryBrainSensor):
@@ -108,8 +128,18 @@ class BatteriesCriticalSensor(BatteryBrainSensor):
         return len(self._data.critical)
 
     @property
-    def extra_state_attributes(self) -> dict[str, list[str]]:
-        return {"batteries": [b.name for b in self._data.critical]}
+    def extra_state_attributes(self) -> dict[str, dict]:
+        attrs: dict[str, dict] = {}
+        for info in self._data.critical:
+            attrs[info.name] = {
+                "category": info.category,
+                "status": info.status,
+                "last_value": info.last_value,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "source_entity": info.source_entity,
+            }
+        return attrs
 
 
 class AllBatteriesSensor(BatteryBrainSensor):

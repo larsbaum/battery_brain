@@ -182,6 +182,11 @@ class BatteryHistoryStore:
             return None
         return data.get("last_classified")
 
+    def reset_all_last_classified(self) -> None:
+        for data in self._data.values():
+            data.pop("last_classified", None)
+        self._schedule_save()
+
     def set_category(
         self, entity_id: str, category: str, *, now_ts: float | None = None
     ) -> None:

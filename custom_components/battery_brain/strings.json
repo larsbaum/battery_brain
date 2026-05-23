@@ -52,6 +52,11 @@
       "test_mode": {
         "name": "Test Mode"
       }
+    },
+    "button": {
+      "reclassify": {
+        "name": "Reclassify Batteries"
+      }
     }
   }
 }

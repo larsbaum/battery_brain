@@ -22,6 +22,7 @@ def _platforms_for_entry(entry: ConfigEntry) -> list[Platform]:
     platforms: list[Platform] = [Platform.SENSOR]
     if entry.data.get(CONF_DEVELOPER_MODE, False):
         platforms.append(Platform.SWITCH)
+        platforms.append(Platform.BUTTON)
     return platforms
 
 

@@ -345,6 +345,12 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             }
         )
 
+    async def async_force_reclassify(self) -> None:
+        """Reset classification timestamps and trigger an immediate update."""
+        self.store.reset_all_last_classified()
+        LOGGER.info("Forced reclassification triggered")
+        await self.async_refresh()
+
     # ------------------------------------------------------------------
     # Core update loop
     # ------------------------------------------------------------------

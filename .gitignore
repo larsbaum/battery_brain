@@ -41,3 +41,6 @@ htmlcov/
 
 # Test batteries (local dev only, not part of BatteryBrain)
 test_batteries/
+
+# Internal spec / architecture notes (not for public repo)
+SPEC.md

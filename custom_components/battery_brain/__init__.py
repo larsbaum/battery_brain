@@ -30,24 +30,24 @@ async def async_setup_entry(
 ) -> bool:
     """Set up BatteryBrain from a config entry."""
     coordinator = BatteryBrainCoordinator(hass, entry)
+    # Initial refresh — picks up whichever battery sensors are already
+    # registered. Sensors that load later are caught by the post-start refresh.
+    await coordinator.async_config_entry_first_refresh()
+
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(
         entry, _platforms_for_entry(entry)
     )
 
-    # Defer the first discovery+refresh until HA has finished starting up.
-    # During HA startup, integrations load in parallel — many battery sensors
-    # (mobile_app, Zigbee, etc.) may not yet be registered when BatteryBrain
-    # initialises. Waiting for EVENT_HOMEASSISTANT_STARTED ensures the first
-    # _discover_batteries() scan sees the complete entity state.
-    async def _first_refresh(_hass: HomeAssistant) -> None:
-        await coordinator.async_config_entry_first_refresh()
+    # If HA is still starting up, trigger an additional refresh once it's
+    # done. Battery-providing integrations (mobile_app, Zigbee, Xiaomi, …)
+    # may load after BatteryBrain — without this second pass, those sensors
+    # would only be picked up at the next coordinator tick (15 min later).
+    if hass.state != CoreState.running:
+        async def _refresh_after_start(_hass: HomeAssistant) -> None:
+            await coordinator.async_refresh()
 
-    if hass.state == CoreState.running:
-        # HA already running (manual add or reload) — refresh immediately
-        await coordinator.async_config_entry_first_refresh()
-    else:
-        entry.async_on_unload(async_at_started(hass, _first_refresh))
+        entry.async_on_unload(async_at_started(hass, _refresh_after_start))
 
     return True
 

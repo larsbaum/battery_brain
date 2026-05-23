@@ -66,6 +66,7 @@ class TestClassifyVoltage:
 
 class TestClassifyRechargeable:
     def test_two_charge_cycles(self):
+        # Gradual discharge (-5pp/step) then gradual recharge (+5pp/step), twice
         vals = (
             list(range(100, 20, -5))
             + list(range(20, 100, 5))
@@ -80,6 +81,52 @@ class TestClassifyRechargeable:
 
     def test_too_few_values(self):
         assert classify_battery([100, 50, 100]) != CATEGORY_RECHARGEABLE
+
+    def test_instant_jumps_not_rechargeable(self):
+        # Battery replaced twice (instant +90 pp jump) — must NOT be classified as rechargeable
+        vals = list(range(100, 0, -1)) + [92] + list(range(92, 0, -1)) + [95]
+        assert classify_battery(vals) != CATEGORY_RECHARGEABLE
+
+    def test_per_tick_discharge_two_cycles(self):
+        # Simulate real 200x test-mode: discharge 0.16pp/tick, charge 5.2pp/tick
+        # Two full cycles should be detected as rechargeable
+        import math
+        discharge_step = 0.156  # 15%/day at 200x, per tick
+        charge_step = 5.208     # 500%/day at 200x, per tick
+        vals = [100.0]
+        charging_target = None
+        for _ in range(1300):
+            if charging_target is not None:
+                v = round(min(vals[-1] + charge_step, charging_target), 1)
+                vals.append(v)
+                if v >= charging_target:
+                    charging_target = None
+            else:
+                v = round(max(vals[-1] - discharge_step, 0.0), 1)
+                vals.append(v)
+                if v <= 10.0:
+                    charging_target = 97.0
+        assert classify_battery(vals) == CATEGORY_RECHARGEABLE
+
+    def test_erratic_not_rechargeable(self):
+        # Random values between 30-80% — should NOT be classified as rechargeable
+        import random
+        random.seed(42)
+        vals = [round(random.uniform(30, 80), 1) for _ in range(1300)]
+        assert classify_battery(vals) != CATEGORY_RECHARGEABLE
+
+    def test_low_stable_not_rechargeable(self):
+        # Values oscillating near 5% — should NOT be classified as rechargeable
+        # (never drops 15pp from local peak so discharge gate never opens)
+        import random
+        random.seed(7)
+        walk = 0.0
+        vals = []
+        for _ in range(500):
+            walk += random.gauss(0, 0.1) * 0.3
+            walk = max(-2, min(2, walk))
+            vals.append(round(max(0.0, 5.0 + walk + random.gauss(0, 0.3)), 1))
+        assert classify_battery(vals) != CATEGORY_RECHARGEABLE
 
 
 class TestClassifyLowStable:

@@ -629,6 +629,9 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 val = float(info.last_value)
             else:
                 continue
+            raw = self.store.get_raw_points(entity_id)
+            if raw and raw[-1][1] == val:
+                continue
             self.store.add_point(entity_id, now, val)
 
     def _update_confidence(

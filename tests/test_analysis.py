@@ -115,6 +115,26 @@ class TestClassifyRechargeable:
         vals = [round(random.uniform(30, 80), 1) for _ in range(1300)]
         assert classify_battery(vals) != CATEGORY_RECHARGEABLE
 
+    def test_erratic_near_zero_not_rechargeable(self):
+        # Sensor mostly at 0% with random spikes — erratic, not rechargeable
+        vals = [0.0] * 200 + [0, 1.7, 4.5, 11.9, 22.1, 28.1, 34.0, 30.5, 25.5]
+        vals += [0.0] * 300
+        vals += [10.9, 25.4, 31.3, 26.3, 30.1, 35.9, 41.5, 47.6, 55.3, 20, 0]
+        vals += [0.0] * 200
+        assert classify_battery(vals) != CATEGORY_RECHARGEABLE
+
+    def test_fast_cycling_rechargeable(self):
+        # Wall panel with rapid charge/discharge cycles (steps ~10-18pp)
+        vals = []
+        for _ in range(50):
+            # Discharge: 80 -> 30 in 5 steps
+            for v in [80, 65, 50, 40, 30]:
+                vals.append(float(v))
+            # Charge: 30 -> 80 in 5 steps
+            for v in [42, 55, 62, 72, 80]:
+                vals.append(float(v))
+        assert classify_battery(vals) == CATEGORY_RECHARGEABLE
+
     def test_low_stable_not_rechargeable(self):
         # Values oscillating near 5% — should NOT be classified as rechargeable
         # (never drops 15pp from local peak so discharge gate never opens)
@@ -184,6 +204,39 @@ class TestClassifyLinear:
 
     def test_flat_not_linear(self):
         vals = [80, 80, 80, 80, 80, 80, 80]
+        assert classify_battery(vals) != CATEGORY_LINEAR
+
+    def test_slow_integer_decline_with_replacement(self):
+        # Sensor that drops 1% at a time over thousands of readings,
+        # then gets a battery replacement (large jump up).
+        vals = []
+        # Phase 1: slow decline from 23 to 6 with integer noise
+        for i in range(700):
+            base = 23 - (17 * i / 700)
+            vals.append(round(base))
+        # Battery replacement jump
+        vals.append(55.0)
+        # Phase 2: slowly declining from 55
+        for i in range(150):
+            vals.append(round(55 - (4 * i / 150)))
+        assert classify_battery(vals) == CATEGORY_LINEAR
+
+    def test_slow_decline_no_replacement(self):
+        # Very slow decline with mostly flat readings (integer sensor)
+        vals = []
+        for i in range(500):
+            base = 80 - (40 * i / 500)
+            vals.append(round(base))
+        assert classify_battery(vals) == CATEGORY_LINEAR
+
+
+    def test_sawtooth_charge_cycles_not_linear(self):
+        # Rechargeable with large charge steps (>20pp) must not be caught
+        # by segmentation — many segments = cycling, not replacements.
+        vals = []
+        for _ in range(80):
+            for v in [80, 65, 50, 35, 55, 75, 90]:
+                vals.append(float(v))
         assert classify_battery(vals) != CATEGORY_LINEAR
 
 

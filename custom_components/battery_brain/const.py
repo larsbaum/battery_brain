@@ -8,8 +8,8 @@ DOMAIN = "battery_brain"
 LOGGER = logging.getLogger(__package__)
 
 # --- Update intervals (seconds) ---
-COORDINATOR_UPDATE_INTERVAL = 900  # 15 minutes
-CATEGORY_RECLASSIFY_INTERVAL = 86400  # 24 hours
+COORDINATOR_UPDATE_INTERVAL = 300  # 5 minutes
+CATEGORY_RECLASSIFY_INTERVAL = 3600  # 1 hour
 
 # --- History thresholds (days) ---
 MIN_HISTORY_DAYS = 7

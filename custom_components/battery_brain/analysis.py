@@ -78,22 +78,28 @@ def _is_rechargeable(values: list[float]) -> bool:
 
     Key distinctions:
     - Rechargeable device: value drops ≥15 pp from its recent peak (clear discharge),
-      then rises gradually over ≥6 steps, each step ≤15 pp (gradual recharge).
-    - Battery replacement: value jumps instantly by >15 pp in a single step — this
+      then rises gradually over ≥5 steps, each step ≤20 pp (gradual recharge).
+    - Battery replacement: value jumps instantly by >20 pp in a single step — this
       resets the tracking and does NOT count as a charge event.
     - Low-stable / erratic: never drops 15 pp from its local peak, so the discharge
       gate is never opened and no charge events are counted.
+    - Erratic sensors (median ≤5, >40% values near zero) are filtered out upfront.
 
     This algorithm works for both per-tick raw data (step size ≈0.15 pp/tick) and
-    coarser aggregated data (step size ≈1–15 pp/day).
+    coarser aggregated data (step size ≈1–20 pp/day).
     """
     if len(values) < 10:
         return False
 
+    near_zero_ratio = sum(1 for v in values if v <= 1) / len(values)
+    if _median(values) <= 5 and near_zero_ratio > 0.4:
+        return False
+
     _MIN_DISCHARGE = 15.0   # must drop this far below local peak to enter discharge state
     _MIN_CUMULATIVE = 30.0  # cumulative rise required to count as one charge cycle
-    _MAX_SINGLE_STEP = 15.0 # single step above this → replacement event, resets tracking
-    _MIN_STEPS = 6          # minimum consecutive rising steps (ensures gradual, not instant)
+    _MAX_SINGLE_STEP = 20.0 # single step above this → replacement event, resets tracking
+    _MIN_STEPS = 5          # minimum consecutive rising steps (ensures gradual, not instant)
+    _DROP_RESET = -0.5      # fell back during apparent charging → reset rise tracking
 
     charge_events = 0
     peak = values[0]
@@ -135,8 +141,8 @@ def _is_rechargeable(values: list[float]) -> bool:
                     peak = values[i]
                     cumulative_rise = 0.0
                     step_count = 0
-            elif delta < -0.5:
-                # Fell back down during apparent charging → reset rise tracking
+            elif delta < _DROP_RESET:
+                # Fell back down significantly during charging → reset rise tracking
                 cumulative_rise = 0.0
                 step_count = 0
 
@@ -200,23 +206,62 @@ def _is_plateau_cliff(values: list[float]) -> bool:
 
 
 def _is_linear(values: list[float]) -> bool:
-    """Mostly monotonic decline with an overall drop > 5 pp."""
+    """Mostly monotonic decline with an overall drop > 5 pp.
+
+    Handles two common edge cases:
+    - Battery replacements (large upward jumps) split the data into segments;
+      each segment is checked independently.
+    - Slow-declining integer sensors use coarser windowing to filter noise.
+    """
     if len(values) < 5:
         return False
 
+    if _check_linear_segment(values):
+        return True
+
+    segments = _split_at_replacements(values, threshold=20.0)
+    if len(segments) <= 5:
+        for seg in segments:
+            if len(seg) >= 30 and _check_linear_segment(seg):
+                return True
+
+    return False
+
+
+def _check_linear_segment(values: list[float]) -> bool:
+    if len(values) < 5:
+        return False
+    if values[-1] - values[0] >= -5:
+        return False
+    if _descent_ratio(values, skip=1) > 0.65:
+        return True
+    skip = max(2, min(24, len(values) // 20))
+    return _descent_ratio(values, skip=skip) > 0.65
+
+
+def _descent_ratio(values: list[float], skip: int = 1) -> float:
     decreases = increases = 0
-    for i in range(1, len(values)):
-        d = values[i] - values[i - 1]
+    for i in range(skip, len(values)):
+        d = values[i] - values[i - skip]
         if d < -0.5:
             decreases += 1
         elif d > 0.5:
             increases += 1
-
     total = decreases + increases
-    if total == 0:
-        return False
+    return decreases / total if total > 0 else 0.0
 
-    return (decreases / total) > 0.65 and (values[-1] - values[0]) < -5
+
+def _split_at_replacements(
+    values: list[float], threshold: float = 20.0
+) -> list[list[float]]:
+    segments: list[list[float]] = []
+    start = 0
+    for i in range(1, len(values)):
+        if values[i] - values[i - 1] > threshold:
+            segments.append(values[start:i])
+            start = i
+    segments.append(values[start:])
+    return segments
 
 
 # =====================================================================

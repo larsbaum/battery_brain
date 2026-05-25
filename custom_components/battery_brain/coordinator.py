@@ -109,6 +109,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self._test_mode_start_virtual: float = 0.0
         self._time_factor: int = TEST_MODE_TIME_FACTOR
         self._debug_logger: Any = None
+        self._production_logger: Any = None
 
     @property
     def developer_mode(self) -> bool:
@@ -327,6 +328,132 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             }
         )
 
+    # ------------------------------------------------------------------
+    # Production logging (always on)
+    # ------------------------------------------------------------------
+
+    def _init_production_logger(self) -> None:
+        from .production_log import LOG_DIR, ProductionLogger
+
+        base_dir = self.hass.config.path(LOG_DIR)
+        self._production_logger = ProductionLogger(base_dir)
+        LOGGER.info("Production log directory: %s", base_dir)
+        self._production_logger.log(
+            {
+                "type": "start",
+                "ts": dt_util.utcnow().timestamp(),
+                "iso": dt_util.utcnow().isoformat(),
+                "options": {
+                    k: v
+                    for k, v in self.config_entry.options.items()
+                    if k != "password"
+                },
+            }
+        )
+
+    def _prod_log_update(self, data: BatteryBrainData) -> None:
+        if self._production_logger is None:
+            return
+
+        now = dt_util.utcnow().timestamp()
+        now_for_store = self._get_now_ts()
+
+        batteries_snapshot: dict[str, Any] = {}
+        for entity_id, info in data.batteries.items():
+            raw = self.store.get_raw_points(entity_id)
+            batteries_snapshot[entity_id] = {
+                "name": info.name,
+                "value": info.last_value,
+                "category": info.category,
+                "status": info.status,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "is_binary": info.is_binary,
+                "unit": info.unit,
+                "history_days": round(
+                    self.store.get_history_days(
+                        entity_id, now_ts=now_for_store
+                    ),
+                    2,
+                ),
+                "raw_points_count": len(raw),
+                "daily_summaries_count": len(
+                    self.store.get_daily_summaries(entity_id)
+                ),
+            }
+
+        self._production_logger.log(
+            {
+                "type": "update",
+                "ts": now,
+                "iso": self._ts_iso(now),
+                "update_interval_s": self.update_interval.total_seconds(),
+                "sensors": {
+                    "normal": len(data.normal),
+                    "warning": len(data.warning),
+                    "critical": len(data.critical),
+                    "total": len(data.batteries),
+                },
+                "batteries": batteries_snapshot,
+            }
+        )
+
+    def _prod_log_state_change(
+        self,
+        entity_id: str,
+        old_state_str: str | None,
+        new_state_str: str,
+        info: BatteryInfo,
+    ) -> None:
+        if self._production_logger is None:
+            return
+
+        now = dt_util.utcnow().timestamp()
+        self._production_logger.log(
+            {
+                "type": "state_change",
+                "ts": now,
+                "iso": self._ts_iso(now),
+                "entity_id": entity_id,
+                "old_state": old_state_str,
+                "new_state": new_state_str,
+                "status": info.status,
+                "category": info.category,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "value": info.last_value,
+            }
+        )
+
+    def _prod_log_classification(
+        self,
+        entity_id: str,
+        old_category: str | None,
+        new_category: str,
+    ) -> None:
+        if self._production_logger is None:
+            return
+
+        now = dt_util.utcnow().timestamp()
+        raw = self.store.get_raw_points(entity_id)
+        self._production_logger.log(
+            {
+                "type": "classification",
+                "ts": now,
+                "iso": self._ts_iso(now),
+                "entity_id": entity_id,
+                "old_category": old_category,
+                "new_category": new_category,
+                "history_days": round(
+                    self.store.get_history_days(
+                        entity_id, now_ts=self._get_now_ts()
+                    ),
+                    2,
+                ),
+                "raw_points_count": len(raw),
+            }
+        )
+
     async def async_force_reclassify(self) -> None:
         """Reset classification timestamps and trigger an immediate update."""
         self.store.reset_all_last_classified()
@@ -341,6 +468,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         if not self._store_loaded:
             await self.store.async_load()
             self._store_loaded = True
+            self._init_production_logger()
             if self.developer_mode:
                 self._reset_test_mode_meta()
                 self._init_debug_logger()
@@ -361,8 +489,11 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self._update_state_listeners(set(batteries.keys()))
 
         self._log_update(data)
+        self._prod_log_update(data)
         if self._debug_logger is not None:
             await self._debug_logger.async_flush(self.hass)
+        if self._production_logger is not None:
+            await self._production_logger.async_flush(self.hass)
 
         return data
 
@@ -517,6 +648,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
 
             if info.category != old_cat:
                 self._log_classification(entity_id, old_cat, info.category)
+                self._prod_log_classification(entity_id, old_cat, info.category)
 
             self.store.set_category(entity_id, info.category, now_ts=now)
 
@@ -712,6 +844,9 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         old_state_obj = event.data.get("old_state")
         old_state_str = old_state_obj.state if old_state_obj else None
         self._log_state_change(
+            entity_id, old_state_str, new_state.state, updated
+        )
+        self._prod_log_state_change(
             entity_id, old_state_str, new_state.state, updated
         )
 

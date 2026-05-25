@@ -110,6 +110,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self._time_factor: int = TEST_MODE_TIME_FACTOR
         self._debug_logger: Any = None
         self._production_logger: Any = None
+        self._reclassify_reason: str | None = None
 
     @property
     def developer_mode(self) -> bool:
@@ -284,6 +285,11 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         entity_id: str,
         old_category: str | None,
         new_category: str,
+        *,
+        reason: str = "interval",
+        category_changed: bool = True,
+        old_status: str | None = None,
+        current_value: float | str | None = None,
     ) -> None:
         if self._debug_logger is None:
             return
@@ -300,6 +306,10 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 "entity_id": entity_id,
                 "old_category": old_category,
                 "new_category": new_category,
+                "category_changed": category_changed,
+                "reason": reason,
+                "old_status": old_status,
+                "current_value": current_value,
                 "history_days": round(
                     self.store.get_history_days(
                         entity_id, now_ts=self._get_now_ts()
@@ -325,6 +335,27 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 "virtual_ts": self._get_now_ts(),
                 "active": active,
                 "time_factor": self._time_factor,
+            }
+        )
+
+    def _log_stale_change(
+        self, entity_id: str, info: BatteryInfo
+    ) -> None:
+        if self._debug_logger is None:
+            return
+
+        now_real = dt_util.utcnow().timestamp()
+        self._debug_logger.log(
+            {
+                "type": "stale_change",
+                "real_ts": now_real,
+                "real_iso": self._ts_iso(now_real),
+                "virtual_ts": self._get_now_ts(),
+                "entity_id": entity_id,
+                "stale": info.stale,
+                "status": info.status,
+                "category": info.category,
+                "value": info.last_value,
             }
         )
 
@@ -430,6 +461,11 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         entity_id: str,
         old_category: str | None,
         new_category: str,
+        *,
+        reason: str = "interval",
+        category_changed: bool = True,
+        old_status: str | None = None,
+        current_value: float | str | None = None,
     ) -> None:
         if self._production_logger is None:
             return
@@ -444,6 +480,10 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 "entity_id": entity_id,
                 "old_category": old_category,
                 "new_category": new_category,
+                "category_changed": category_changed,
+                "reason": reason,
+                "old_status": old_status,
+                "current_value": current_value,
                 "history_days": round(
                     self.store.get_history_days(
                         entity_id, now_ts=self._get_now_ts()
@@ -454,9 +494,30 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             }
         )
 
+    def _prod_log_stale_change(
+        self, entity_id: str, info: BatteryInfo
+    ) -> None:
+        if self._production_logger is None:
+            return
+
+        now = dt_util.utcnow().timestamp()
+        self._production_logger.log(
+            {
+                "type": "stale_change",
+                "ts": now,
+                "iso": self._ts_iso(now),
+                "entity_id": entity_id,
+                "stale": info.stale,
+                "status": info.status,
+                "category": info.category,
+                "value": info.last_value,
+            }
+        )
+
     async def async_force_reclassify(self) -> None:
         """Reset classification timestamps and trigger an immediate update."""
         self.store.reset_all_last_classified()
+        self._reclassify_reason = "manual"
         LOGGER.info("Forced reclassification triggered")
         await self.async_refresh()
 
@@ -620,6 +681,9 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         if self._test_mode_active:
             reclassify_interval /= self._time_factor
 
+        reason_override = self._reclassify_reason
+        self._reclassify_reason = None
+
         for entity_id, info in batteries.items():
             stored_cat = self.store.get_category(entity_id)
             last_classified = self.store.get_last_classified(entity_id)
@@ -646,9 +710,36 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             else:
                 info.category = CATEGORY_UNKNOWN_DEFAULT
 
-            if info.category != old_cat:
-                self._log_classification(entity_id, old_cat, info.category)
-                self._prod_log_classification(entity_id, old_cat, info.category)
+            if stored_cat is None:
+                reason = "first"
+            elif reason_override == "manual":
+                reason = "manual"
+            else:
+                reason = "interval"
+
+            category_changed = info.category != old_cat
+            old_status = None
+            if self.data and entity_id in self.data.batteries:
+                old_status = self.data.batteries[entity_id].status
+
+            self._log_classification(
+                entity_id,
+                old_cat,
+                info.category,
+                reason=reason,
+                category_changed=category_changed,
+                old_status=old_status,
+                current_value=info.last_value,
+            )
+            self._prod_log_classification(
+                entity_id,
+                old_cat,
+                info.category,
+                reason=reason,
+                category_changed=category_changed,
+                old_status=old_status,
+                current_value=info.last_value,
+            )
 
             self.store.set_category(entity_id, info.category, now_ts=now)
 
@@ -694,8 +785,14 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
     ) -> None:
         now = self._get_now_ts()
         for entity_id, info in batteries.items():
-            last_ts = self.store.get_last_update_ts(entity_id)
+            last_ts = (
+                self.store.get_last_seen_ts(entity_id)
+                or self.store.get_last_update_ts(entity_id)
+            )
             median_iv = self.store.get_median_interval(entity_id)
+            was_stale = False
+            if self.data and entity_id in self.data.batteries:
+                was_stale = self.data.batteries[entity_id].stale
             info.stale = check_stale(
                 last_update_ts=last_ts,
                 median_interval=median_iv,
@@ -704,6 +801,9 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             )
             if info.stale:
                 info.status = STATUS_CRITICAL
+            if info.stale != was_stale:
+                self._log_stale_change(entity_id, info)
+                self._prod_log_stale_change(entity_id, info)
 
     # ------------------------------------------------------------------
     # History integration
@@ -743,6 +843,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 val = float(info.last_value)
             else:
                 continue
+            self.store.set_last_seen(entity_id, now)
             raw = self.store.get_raw_points(entity_id)
             if raw and raw[-1][1] == val:
                 continue
@@ -823,6 +924,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 except (ValueError, TypeError):
                     val = None
             if val is not None:
+                self.store.set_last_seen(entity_id, now)
                 self.store.add_point(entity_id, now, val)
 
         updated = self._build_battery_info(

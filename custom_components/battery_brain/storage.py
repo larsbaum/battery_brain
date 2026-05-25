@@ -135,6 +135,19 @@ class BatteryHistoryStore:
         values.sort(key=lambda p: p[0])
         return [v for _, v in values]
 
+    def get_last_seen_ts(self, entity_id: str) -> float | None:
+        """Timestamp when the sensor was last observed alive by the coordinator."""
+        data = self._data.get(entity_id)
+        if not data:
+            return None
+        return data.get("last_seen")
+
+    def set_last_seen(self, entity_id: str, ts: float) -> None:
+        """Update the last-seen timestamp (in-memory only, no save triggered)."""
+        data = self._data.get(entity_id)
+        if data is not None:
+            data["last_seen"] = ts
+
     def get_last_update_ts(self, entity_id: str) -> float | None:
         """Timestamp of the most recent data point."""
         data = self._data.get(entity_id)
@@ -210,6 +223,7 @@ class BatteryHistoryStore:
                 "raw_points": [],
                 "daily_summaries": [],
                 "first_seen": ts,
+                "last_seen": ts,
                 "seeded": False,
             }
         return self._data[entity_id]

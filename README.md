@@ -1,10 +1,13 @@
 # BatteryBrain
 
-[![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/larsbaum/battery_brain.svg)](https://github.com/larsbaum/battery_brain/releases)
-[![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.6%2B-blue.svg)](https://www.home-assistant.io/)
-[![Beta](https://img.shields.io/badge/Status-Beta-yellow.svg)](#)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![GitHub Release][releases-shield]][releases]
+[![GitHub Activity][commits-shield]][commits]
+[![Downloads][download-latest-shield]]()
+[![HACS Installs][hacs-installs-shield]]()
+[![License][license-shield]](LICENSE)
+[![hacs][hacsbadge]][hacs]
+
+![Dashboard Overview](images/dark_logo.png)
 
 **Intelligent battery health monitoring for Home Assistant** — automatically discovers all your batteries, learns their behavior, and tells you which ones actually need attention.
 
@@ -34,6 +37,7 @@
 
 ### HACS (recommended)
 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=larsbaum&repository=battery_brain&category=Integration)
 1. Open **HACS** in your Home Assistant instance
 2. Click the three-dot menu (top right) **> Custom repositories**
 3. Add this URL with category **Integration**:
@@ -120,19 +124,20 @@ BatteryBrain classifies each battery into one of 7 archetypes based on its behav
 | **Binary** | Simple low/normal battery indicators | Binary sensor with `device_class: battery` |
 | **Unknown** | New batteries, insufficient data | Fallback until 7+ days of data are available |
 
-<!-- TODO: Diagram or illustration showing the 7 archetypes with example drain curves -->
-<!-- Place an image here: docs/images/archetypes.png -->
-![Battery Archetypes](docs/images/archetypes.png)
-
 ---
 
-## Dashboard Example
+## Dashboard Examples
 
-You can use the summary sensors to build a battery overview card. Here's a simple example using the [auto-entities](https://github.com/thomasloven/lovelace-auto-entities) card:
+### Quick Overview Card
+
+A simple entities card showing the battery counts at a glance. No extra frontend cards required.
+
+<details>
+<summary><strong>Show YAML</strong></summary>
 
 ```yaml
 type: entities
-title: Battery Health
+title: Battery Brain
 entities:
   - entity: sensor.battery_brain_batteries_critical
     name: Critical
@@ -148,7 +153,120 @@ entities:
     icon: mdi:battery-heart
 ```
 
-For a detailed per-battery view, you can use a Markdown card that reads the attributes from `sensor.battery_brain_all_batteries`.
+</details>
+
+### Detailed Battery Dashboard
+
+For a full battery overview grouped by health status, you can use [auto-entities](https://github.com/thomasloven/lovelace-auto-entities) + [mushroom](https://github.com/piitaya/lovelace-mushroom) cards. Each battery shows its current value, archetype, and confidence — color-coded by status.
+
+![Battery Dashboard Example](images/battery_dashboard.png)
+
+<details>
+<summary><strong>Show dashboard YAML</strong></summary>
+
+Three columns side by side — critical, warning, normal — each with mushroom cards showing value, archetype, and confidence. Tap any card to open the entity details.
+
+```yaml
+type: horizontal-stack
+cards:
+  - type: vertical-stack
+    cards:
+      - type: custom:mushroom-title-card
+        title: Critical
+        subtitle: "{{ states('sensor.battery_brain_batteries_critical') }} batteries"
+        title_tap_action:
+          action: more-info
+          entity: sensor.battery_brain_batteries_critical
+        card_mod:
+          style: |
+            ha-card { --title-color: var(--error-color, #db4437); }
+      - type: custom:auto-entities
+        card:
+          type: grid
+          columns: 1
+          square: false
+        card_param: cards
+        filter:
+          template: >
+            {%- set ent = 'sensor.battery_brain_batteries_critical' -%} {%- set
+            ns = namespace(cards=[]) -%} {%- for n in states[ent].attributes -%}
+              {%- set d = states[ent].attributes[n] -%}
+              {%- if d is mapping and d.source_entity is defined -%}
+                {%- set ns.cards = ns.cards + [{'type': 'tile', 'entity': d.source_entity, 'color': 'red'}] -%}
+              {%- endif -%}
+            {%- endfor -%} {{ ns.cards }}
+        sort:
+          method: friendly_name
+          ignore_case: true
+        show_empty: false
+  - type: vertical-stack
+    cards:
+      - type: custom:mushroom-title-card
+        title: Warning
+        subtitle: "{{ states('sensor.battery_brain_batteries_warning') }} batteries"
+        title_tap_action:
+          action: more-info
+          entity: sensor.battery_brain_batteries_warning
+        card_mod:
+          style: |
+            ha-card { --title-color: var(--warning-color, #ffa726); }
+      - type: custom:auto-entities
+        card:
+          type: grid
+          columns: 1
+          square: false
+        card_param: cards
+        filter:
+          template: >
+            {%- set ent = 'sensor.battery_brain_batteries_warning' -%} {%- set
+            ns = namespace(cards=[]) -%} {%- for n in states[ent].attributes -%}
+              {%- set d = states[ent].attributes[n] -%}
+              {%- if d is mapping and d.source_entity is defined -%}
+                {%- set ns.cards = ns.cards + [{'type': 'tile', 'entity': d.source_entity, 'color': 'orange'}] -%}
+              {%- endif -%}
+            {%- endfor -%} {{ ns.cards }}
+        sort:
+          method: friendly_name
+          ignore_case: true
+        show_empty: false
+  - type: vertical-stack
+    cards:
+      - type: custom:mushroom-title-card
+        title: Normal
+        subtitle: "{{ states('sensor.battery_brain_batteries_normal') }} batteries"
+        title_tap_action:
+          action: more-info
+          entity: sensor.battery_brain_batteries_normal
+        card_mod:
+          style: |
+            ha-card { --title-color: var(--success-color, #43a047); }
+      - type: custom:auto-entities
+        card:
+          type: grid
+          columns: 1
+          square: false
+        card_param: cards
+        filter:
+          template: >
+            {%- set ent = 'sensor.battery_brain_batteries_normal' -%} {%- set ns
+            = namespace(cards=[]) -%} {%- for n in states[ent].attributes -%}
+              {%- set d = states[ent].attributes[n] -%}
+              {%- if d is mapping and d.source_entity is defined -%}
+                {%- set ns.cards = ns.cards + [{'type': 'tile', 'entity': d.source_entity, 'color': 'green'}] -%}
+              {%- endif -%}
+            {%- endfor -%} {{ ns.cards }}
+        sort:
+          method: friendly_name
+          ignore_case: true
+        show_empty: false
+grid_options:
+  columns: 24
+  rows: auto
+```
+
+> Requires HACS frontend cards: [auto-entities](https://github.com/thomasloven/lovelace-auto-entities) and [mushroom](https://github.com/piitaya/lovelace-mushroom).
+
+</details>
 
 ---
 

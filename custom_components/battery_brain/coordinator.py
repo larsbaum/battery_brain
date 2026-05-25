@@ -112,35 +112,17 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
 
     @property
     def developer_mode(self) -> bool:
-        return bool(self.config_entry.data.get(CONF_DEVELOPER_MODE, False))
+        return bool(self.config_entry.options.get(CONF_DEVELOPER_MODE, False))
 
     @property
     def test_mode_active(self) -> bool:
         return self._test_mode_active
 
-    def _restore_test_mode(self) -> None:
-        """Restore test mode state from persistent storage after restart."""
-        if not self.store.get_meta("test_mode_active", False):
-            return
-        saved_real = self.store.get_meta("test_mode_start_real", 0.0)
-        saved_virtual = self.store.get_meta("test_mode_start_virtual", 0.0)
-        if not saved_real or not saved_virtual:
-            return
-        real_now = dt_util.utcnow().timestamp()
-        elapsed_while_off = real_now - saved_real
-        self._test_mode_start_real = real_now
-        self._test_mode_start_virtual = (
-            saved_virtual + elapsed_while_off * self._time_factor
-        )
-        self._test_mode_active = True
-        self.update_interval = timedelta(
-            seconds=COORDINATOR_UPDATE_INTERVAL / self._time_factor
-        )
-        LOGGER.info(
-            "Test mode restored (time factor: %dx, virtual time advanced by %.1f days while offline)",
-            self._time_factor,
-            elapsed_while_off * self._time_factor / 86400,
-        )
+    def _reset_test_mode_meta(self) -> None:
+        """Ensure test mode is off in storage so it never auto-activates."""
+        if self.store.get_meta("test_mode_active", False):
+            self.store.set_meta("test_mode_active", False)
+            LOGGER.info("Test mode was active in storage — reset to off")
 
     def activate_test_mode(self) -> None:
         real_now = dt_util.utcnow().timestamp()
@@ -360,7 +342,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             await self.store.async_load()
             self._store_loaded = True
             if self.developer_mode:
-                self._restore_test_mode()
+                self._reset_test_mode_meta()
                 self._init_debug_logger()
 
         if self._test_mode_active:

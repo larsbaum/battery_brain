@@ -18,12 +18,22 @@ else:
     BatteryBrainConfigEntry = ConfigEntry
 
 
-def _platforms_for_entry(entry: ConfigEntry) -> list[Platform]:
-    platforms: list[Platform] = [Platform.SENSOR]
-    if entry.data.get(CONF_DEVELOPER_MODE, False):
-        platforms.append(Platform.SWITCH)
-        platforms.append(Platform.BUTTON)
-    return platforms
+PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BUTTON]
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> bool:
+    """Migrate config entry from v1 to v2."""
+    if entry.version == 1:
+        new_options = dict(entry.options)
+        new_data = dict(entry.data)
+        dev_mode = new_data.pop(CONF_DEVELOPER_MODE, False)
+        new_options.setdefault(CONF_DEVELOPER_MODE, dev_mode)
+        hass.config_entries.async_update_entry(
+            entry, data=new_data, options=new_options, version=2, minor_version=1
+        )
+    return True
 
 
 async def async_setup_entry(
@@ -37,7 +47,7 @@ async def async_setup_entry(
 
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(
-        entry, _platforms_for_entry(entry)
+        entry, PLATFORMS
     )
 
     # If HA is still starting up, trigger an additional refresh once it's
@@ -58,5 +68,5 @@ async def async_unload_entry(
 ) -> bool:
     """Unload a config entry."""
     return await hass.config_entries.async_unload_platforms(
-        entry, _platforms_for_entry(entry)
+        entry, PLATFORMS
     )

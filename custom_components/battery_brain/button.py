@@ -5,10 +5,11 @@ from __future__ import annotations
 from homeassistant.components.button import ButtonEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import BatteryBrainConfigEntry
-from .const import DOMAIN
+from .const import CONF_DEVELOPER_MODE, DOMAIN
 from .coordinator import BatteryBrainCoordinator
 
 PARALLEL_UPDATES = 0
@@ -20,6 +21,14 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up BatteryBrain button entities."""
+    if not entry.options.get(CONF_DEVELOPER_MODE, False):
+        registry = er.async_get(hass)
+        entity_id = registry.async_get_entity_id(
+            "button", DOMAIN, f"{DOMAIN}_reclassify"
+        )
+        if entity_id is not None:
+            registry.async_remove(entity_id)
+        return
     coordinator = entry.runtime_data
     async_add_entities([ReclassifyButton(coordinator)])
 

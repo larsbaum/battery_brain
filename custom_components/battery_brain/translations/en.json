@@ -5,10 +5,14 @@
         "title": "Set up BatteryBrain",
         "description": "BatteryBrain automatically discovers all battery entities and monitors their health.",
         "data": {
+          "scan_battery_level_attr": "Scan for battery_level attributes",
+          "binary_low_is_critical": "Treat binary low-battery as critical",
           "developer_mode": "Enable developer mode"
         },
         "data_description": {
-          "developer_mode": "Enables a test mode switch that accelerates time by 200x for testing purposes."
+          "scan_battery_level_attr": "Also monitor entities that expose a battery_level attribute, even without the battery device class.",
+          "binary_low_is_critical": "Mark binary battery sensors as critical instead of warning when they report low.",
+          "developer_mode": "The use of this mode is not recommended. Enable it only if explicitly requested by the developer for error analysis purposes."
         }
       }
     },
@@ -23,12 +27,14 @@
         "data": {
           "scan_battery_level_attr": "Scan for battery_level attributes",
           "binary_low_is_critical": "Treat binary low-battery as critical",
-          "exclude_entities": "Excluded entities"
+          "exclude_entities": "Excluded entities",
+          "developer_mode": "Enable developer mode"
         },
         "data_description": {
           "scan_battery_level_attr": "Also monitor entities that expose a battery_level attribute, even without the battery device class.",
           "binary_low_is_critical": "Mark binary battery sensors as critical instead of warning when they report low.",
-          "exclude_entities": "Select entities to exclude from battery monitoring."
+          "exclude_entities": "Select entities to exclude from battery monitoring.",
+          "developer_mode": "The use of this mode is not recommended. Enable it only if explicitly requested by the developer for error analysis purposes."
         }
       }
     }
@@ -50,7 +56,7 @@
     },
     "switch": {
       "test_mode": {
-        "name": "Test Mode"
+        "name": "Test Mode (DO NOT USE — destroys sensor data)"
       }
     },
     "button": {

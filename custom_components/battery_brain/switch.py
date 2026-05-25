@@ -7,11 +7,12 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import BatteryBrainConfigEntry
-from .const import DOMAIN, TEST_MODE_TIME_FACTOR
+from .const import CONF_DEVELOPER_MODE, DOMAIN, TEST_MODE_TIME_FACTOR
 from .coordinator import BatteryBrainCoordinator
 
 PARALLEL_UPDATES = 0
@@ -23,6 +24,14 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up BatteryBrain switch entities."""
+    if not entry.options.get(CONF_DEVELOPER_MODE, False):
+        registry = er.async_get(hass)
+        entity_id = registry.async_get_entity_id(
+            "switch", DOMAIN, f"{DOMAIN}_test_mode"
+        )
+        if entity_id is not None:
+            registry.async_remove(entity_id)
+        return
     coordinator = entry.runtime_data
     async_add_entities([TestModeSwitch(coordinator)])
 

@@ -26,7 +26,8 @@ from .const import (
 class BatteryBrainConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the config flow for BatteryBrain."""
 
-    VERSION = 1
+    VERSION = 2
+    MINOR_VERSION = 1
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -38,15 +39,28 @@ class BatteryBrainConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             return self.async_create_entry(
                 title="BatteryBrain",
-                data={
+                data={},
+                options={
                     CONF_DEVELOPER_MODE: user_input.get(
                         CONF_DEVELOPER_MODE, False
+                    ),
+                    OPT_SCAN_BATTERY_LEVEL_ATTR: user_input.get(
+                        OPT_SCAN_BATTERY_LEVEL_ATTR, False
+                    ),
+                    OPT_BINARY_LOW_IS_CRITICAL: user_input.get(
+                        OPT_BINARY_LOW_IS_CRITICAL, False
                     ),
                 },
             )
 
         schema = vol.Schema(
             {
+                vol.Optional(
+                    OPT_SCAN_BATTERY_LEVEL_ATTR, default=False
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    OPT_BINARY_LOW_IS_CRITICAL, default=False
+                ): selector.BooleanSelector(),
                 vol.Optional(CONF_DEVELOPER_MODE, default=False): bool,
             }
         )
@@ -109,6 +123,12 @@ class BatteryBrainOptionsFlow(OptionsFlowWithReload):
                         ),
                     )
                 ),
+                vol.Optional(
+                    CONF_DEVELOPER_MODE,
+                    default=self.config_entry.options.get(
+                        CONF_DEVELOPER_MODE, False
+                    ),
+                ): selector.BooleanSelector(),
             }
         )
 

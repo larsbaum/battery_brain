@@ -120,6 +120,7 @@ def _install_stubs() -> None:
     class _Platform:
         SENSOR = "sensor"
         SWITCH = "switch"
+        BUTTON = "button"
 
     class _DeviceEntryType:
         SERVICE = "service"

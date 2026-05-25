@@ -2,8 +2,8 @@
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
-[![Downloads][download-latest-shield]]()
-[![HACS Installs][hacs-installs-shield]]()
+[![Downloads][download-latest-shield]][releases]
+[![HACS Installs][hacs-installs-shield]][hacs]
 [![License][license-shield]](LICENSE)
 [![hacs][hacsbadge]][hacs]
 
@@ -426,3 +426,18 @@ Each archetype has its own thresholds:
 <p align="center">
   <sub>Made with battery-powered determination.</sub>
 </p>
+
+[releases-shield]: https://img.shields.io/github/release/larsbaum/battery_brain.svg?style=for-the-badge
+[releases]: https://github.com/larsbaum/battery_brain/releases
+
+[commits-shield]: https://img.shields.io/github/commit-activity/y/larsbaum/battery_brain.svg?style=for-the-badge
+[commits]: https://github.com/larsbaum/battery_brain/commits/main
+
+[download-latest-shield]: https://img.shields.io/github/downloads/larsbaum/battery_brain/latest/total.svg?style=for-the-badge
+
+[hacs-installs-shield]: https://img.shields.io/badge/dynamic/json?color=41BDF5&label=HACS%20Installs&query=%24.battery_brain.total&url=https%3A%2F%2Fanalytics.home-assistant.io%2Fcustom_integrations.json&style=for-the-badge
+
+[license-shield]: https://img.shields.io/github/license/larsbaum/battery_brain.svg?style=for-the-badge
+
+[hacsbadge]: https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge
+[hacs]: https://github.com/hacs/integration

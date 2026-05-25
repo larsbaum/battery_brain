@@ -85,10 +85,6 @@ Each sensor carries **detailed attributes** for every battery in its group, incl
 
 Use these attributes to build detailed dashboards or trigger automations.
 
-<!-- TODO: Screenshot of sensor attributes in the HA Developer Tools -->
-<!-- Place a screenshot here: docs/images/sensor_attributes.png -->
-![Sensor Attributes](docs/images/sensor_attributes.png)
-
 ---
 
 ## Configuration Options

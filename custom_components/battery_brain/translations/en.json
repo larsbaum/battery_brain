@@ -25,12 +25,14 @@
       "init": {
         "title": "BatteryBrain Options",
         "data": {
+          "exclude_integrations": "Excluded integrations",
           "scan_battery_level_attr": "Scan for battery_level attributes",
           "binary_low_is_critical": "Treat binary low-battery as critical",
           "exclude_entities": "Excluded entities",
           "developer_mode": "Enable developer mode"
         },
         "data_description": {
+          "exclude_integrations": "Exclude all battery entities from selected integrations at once.",
           "scan_battery_level_attr": "Also monitor entities that expose a battery_level attribute, even without the battery device class.",
           "binary_low_is_critical": "Mark binary battery sensors as critical instead of warning when they report low.",
           "exclude_entities": "Select entities to exclude from battery monitoring.",

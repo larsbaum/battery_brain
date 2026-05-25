@@ -19,6 +19,7 @@ from .const import (
     DOMAIN,
     OPT_BINARY_LOW_IS_CRITICAL,
     OPT_EXCLUDE_ENTITIES,
+    OPT_EXCLUDE_INTEGRATIONS,
     OPT_SCAN_BATTERY_LEVEL_ATTR,
 )
 
@@ -85,19 +86,60 @@ class BatteryBrainOptionsFlow(OptionsFlowWithReload):
         if user_input is not None:
             return self.async_create_entry(data=user_input)
 
-        registry = er.async_get(self.hass)
-        battery_entities = [
-            entry.entity_id
-            for entry in registry.entities.values()
-            if entry.original_device_class == "battery"
-            or (
-                entry.domain == "binary_sensor"
-                and entry.original_device_class == "battery"
+        coordinator = self.config_entry.runtime_data
+        monitored: set[str] = set()
+        if coordinator and coordinator.data:
+            monitored = set(coordinator.data.batteries.keys())
+
+        currently_excluded = set(
+            self.config_entry.options.get(OPT_EXCLUDE_ENTITIES, [])
+        )
+        all_relevant = sorted(monitored | currently_excluded)
+
+        entity_options = []
+        for eid in all_relevant:
+            state = self.hass.states.get(eid)
+            label = (
+                state.attributes.get("friendly_name", eid)
+                if state
+                else eid
             )
+            entity_options.append(
+                selector.SelectOptionDict(value=eid, label=label)
+            )
+
+        ent_reg = er.async_get(self.hass)
+        battery_platforms: set[str] = set()
+        for eid in monitored | currently_excluded:
+            reg_entry = ent_reg.async_get(eid)
+            if reg_entry:
+                battery_platforms.add(reg_entry.platform)
+        battery_platforms.update(
+            self.config_entry.options.get(OPT_EXCLUDE_INTEGRATIONS, [])
+        )
+
+        integration_options = [
+            selector.SelectOptionDict(
+                value=platform,
+                label=platform.replace("_", " ").title(),
+            )
+            for platform in sorted(battery_platforms)
         ]
 
         options_schema = vol.Schema(
             {
+                vol.Optional(
+                    OPT_EXCLUDE_INTEGRATIONS,
+                    default=self.config_entry.options.get(
+                        OPT_EXCLUDE_INTEGRATIONS, []
+                    ),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=integration_options,
+                        multiple=True,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
                 vol.Optional(
                     OPT_SCAN_BATTERY_LEVEL_ATTR,
                     default=self.config_entry.options.get(
@@ -115,12 +157,11 @@ class BatteryBrainOptionsFlow(OptionsFlowWithReload):
                     default=self.config_entry.options.get(
                         OPT_EXCLUDE_ENTITIES, []
                     ),
-                ): selector.EntitySelector(
-                    selector.EntitySelectorConfig(
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=entity_options,
                         multiple=True,
-                        filter=selector.EntityFilterSelectorConfig(
-                            domain=["sensor", "binary_sensor"]
-                        ),
+                        mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
                 vol.Optional(

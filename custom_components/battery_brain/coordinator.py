@@ -18,6 +18,7 @@ from homeassistant.const import (
     STATE_UNKNOWN,
 )
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -40,6 +41,7 @@ from .const import (
     MIN_HISTORY_DAYS,
     OPT_BINARY_LOW_IS_CRITICAL,
     OPT_EXCLUDE_ENTITIES,
+    OPT_EXCLUDE_INTEGRATIONS,
     OPT_SCAN_BATTERY_LEVEL_ATTR,
     STATUS_CRITICAL,
     STATUS_NORMAL,
@@ -566,6 +568,14 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         exclude = set(
             self.config_entry.options.get(OPT_EXCLUDE_ENTITIES, [])
         )
+        exclude_integrations = set(
+            self.config_entry.options.get(OPT_EXCLUDE_INTEGRATIONS, [])
+        )
+        if exclude_integrations:
+            ent_reg = er.async_get(self.hass)
+            for entry in ent_reg.entities.values():
+                if entry.platform in exclude_integrations:
+                    exclude.add(entry.entity_id)
         scan_attr = self.config_entry.options.get(
             OPT_SCAN_BATTERY_LEVEL_ATTR, False
         )

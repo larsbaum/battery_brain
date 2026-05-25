@@ -71,6 +71,7 @@ HISTORY_MAX_DAYS = 365
 # --- Options flow keys ---
 OPT_SCAN_BATTERY_LEVEL_ATTR = "scan_battery_level_attr"
 OPT_EXCLUDE_ENTITIES = "exclude_entities"
+OPT_EXCLUDE_INTEGRATIONS = "exclude_integrations"
 OPT_BINARY_LOW_IS_CRITICAL = "binary_low_is_critical"
 
 # --- Developer / test mode ---

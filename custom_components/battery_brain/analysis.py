@@ -173,11 +173,20 @@ def _is_low_stable(values: list[float]) -> bool:
 
 
 def _stable_low(values: list[float]) -> bool:
-    """Median < 30 and standard deviation < 10."""
+    """Median < 30 and trimmed standard deviation < 10.
+
+    Trims 10% from each end to resist outlier spikes (e.g. solar-powered
+    sensors that briefly charge to 50%+ during sunny hours).
+    """
     if _median(values) >= 30:
         return False
-    mean_val = sum(values) / len(values)
-    variance = sum((v - mean_val) ** 2 for v in values) / len(values)
+    sorted_v = sorted(values)
+    trim = len(sorted_v) // 10
+    trimmed = sorted_v[trim:-trim] if trim > 0 else sorted_v
+    if not trimmed:
+        return False
+    mean_val = sum(trimmed) / len(trimmed)
+    variance = sum((v - mean_val) ** 2 for v in trimmed) / len(trimmed)
     return variance**0.5 < 10
 
 

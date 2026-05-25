@@ -4,7 +4,6 @@
 [![GitHub Activity][commits-shield]][commits]
 [![Downloads][download-latest-shield]][releases]
 [![HACS Installs][hacs-installs-shield]][hacs]
-[![License][license-shield]](LICENSE)
 [![hacs][hacsbadge]][hacs]
 
 ![Dashboard Overview](images/dark_logo.png)

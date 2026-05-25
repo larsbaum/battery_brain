@@ -2,8 +2,6 @@
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
-[![Downloads][download-latest-shield]][releases]
-[![HACS Installs][hacs-installs-shield]][hacs]
 [![hacs][hacsbadge]][hacs]
 
 ![Dashboard Overview](images/dark_logo.png)

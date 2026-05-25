@@ -15,12 +15,6 @@
 
 ---
 
-<!-- TODO: Screenshot of the BatteryBrain dashboard showing all four sensors -->
-<!-- Place a screenshot here: docs/images/dashboard_overview.png -->
-![Dashboard Overview](docs/images/dashboard_overview.png)
-
----
-
 ## Key Features
 
 - **Zero-config auto-discovery** — finds all battery entities automatically, including voltage-based and binary sensors

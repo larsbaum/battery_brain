@@ -51,6 +51,10 @@ class BatteryBrainSensor(CoordinatorEntity[BatteryBrainCoordinator], SensorEntit
         )
 
     @property
+    def available(self) -> bool:
+        return self.coordinator.startup_complete and super().available
+
+    @property
     def _data(self) -> BatteryBrainData:
         return self.coordinator.data
 

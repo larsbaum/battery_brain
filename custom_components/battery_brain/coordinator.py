@@ -113,6 +113,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self._debug_logger: Any = None
         self._production_logger: Any = None
         self._reclassify_reason: str | None = None
+        self._startup_complete = False
 
     @property
     def developer_mode(self) -> bool:
@@ -121,6 +122,15 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
     @property
     def test_mode_active(self) -> bool:
         return self._test_mode_active
+
+    @property
+    def startup_complete(self) -> bool:
+        return self._startup_complete
+
+    def mark_startup_complete(self) -> None:
+        self._startup_complete = True
+        if self.data is not None:
+            self.async_set_updated_data(self.data)
 
     def _reset_test_mode_meta(self) -> None:
         """Ensure test mode is off in storage so it never auto-activates."""
@@ -945,6 +955,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         )
         updated.category = existing.category
         updated.confidence = existing.confidence
+        updated.stale = existing.stale
 
         binary_critical = self.config_entry.options.get(
             OPT_BINARY_LOW_IS_CRITICAL, False

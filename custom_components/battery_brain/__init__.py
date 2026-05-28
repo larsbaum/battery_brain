@@ -56,9 +56,14 @@ async def async_setup_entry(
     # would only be picked up at the next coordinator tick (15 min later).
     if hass.state != CoreState.running:
         async def _refresh_after_start(_hass: HomeAssistant) -> None:
-            await coordinator.async_refresh()
+            try:
+                await coordinator.async_refresh()
+            finally:
+                coordinator.mark_startup_complete()
 
         entry.async_on_unload(async_at_started(hass, _refresh_after_start))
+    else:
+        coordinator.mark_startup_complete()
 
     return True
 

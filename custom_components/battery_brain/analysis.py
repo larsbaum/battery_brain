@@ -399,7 +399,7 @@ def _status_plateau_cliff(
             return STATUS_CRITICAL
 
     ratio = value / plateau if plateau > 0 else 1.0
-    if ratio >= 0.95:
+    if ratio >= 0.90:
         return STATUS_NORMAL
     if ratio >= 0.70:
         return STATUS_WARNING

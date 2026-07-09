@@ -14,14 +14,20 @@ from .const import (
     CATEGORY_UNKNOWN_DEFAULT,
     CATEGORY_VOLTAGE,
     DEFAULT_THRESHOLDS,
+    NOISE_SMOOTHING_MIN_POINTS,
+    NOISE_SMOOTHING_PERCENTILE,
+    NOISE_SMOOTHING_WINDOW_HOURS,
     PREDICTION_CRITICAL_DAYS,
     PREDICTION_WARNING_DAYS,
+    RECHARGE_MIN_PEAK_RATIO,
     STALE_MIN_HOURS,
     STALE_MULTIPLIER,
     STALE_UNAVAILABLE_HOURS,
     STATUS_CRITICAL,
     STATUS_NORMAL,
     STATUS_WARNING,
+    VOLTAGE_MIN_RANGE_ABS,
+    VOLTAGE_MIN_RANGE_RATIO,
 )
 
 # =====================================================================
@@ -78,11 +84,16 @@ def _is_rechargeable(values: list[float]) -> bool:
 
     Key distinctions:
     - Rechargeable device: value drops ≥15 pp from its recent peak (clear discharge),
-      then rises gradually over ≥5 steps, each step ≤20 pp (gradual recharge).
+      then rises gradually over ≥5 steps, each step ≤20 pp (gradual recharge), and
+      the rise actually reaches close to the device's all-time observed maximum.
     - Battery replacement: value jumps instantly by >20 pp in a single step — this
       resets the tracking and does NOT count as a charge event.
     - Low-stable / erratic: never drops 15 pp from its local peak, so the discharge
       gate is never opened and no charge events are counted.
+    - Periodic environmental artifacts (e.g. a daily temperature-driven sawtooth on
+      an outdoor sensor's reported battery %) can otherwise mimic a discharge/gradual
+      -recharge pattern, but the recovered value never gets close to the device's
+      real "full" level — the peak-ratio gate below filters these out.
     - Erratic sensors (median ≤5, >40% values near zero) are filtered out upfront.
 
     This algorithm works for both per-tick raw data (step size ≈0.15 pp/tick) and
@@ -101,11 +112,22 @@ def _is_rechargeable(values: list[float]) -> bool:
     _MIN_STEPS = 5          # minimum consecutive rising steps (ensures gradual, not instant)
     _DROP_RESET = -0.5      # fell back during apparent charging → reset rise tracking
 
+    peak_floor = max(values) * RECHARGE_MIN_PEAK_RATIO
+
     charge_events = 0
     peak = values[0]
     trough: float | None = None
     cumulative_rise = 0.0
     step_count = 0
+    # A rise that satisfied the cumulative/step gate, but not yet confirmed to have
+    # reached peak_floor — the rise may still be climbing higher before it ends.
+    pending = False
+
+    def resolve_pending() -> None:
+        nonlocal charge_events, pending
+        if pending and peak >= peak_floor:
+            charge_events += 1
+        pending = False
 
     for i in range(1, len(values)):
         delta = values[i] - values[i - 1]
@@ -114,6 +136,7 @@ def _is_rechargeable(values: list[float]) -> bool:
         if values[i] > peak:
             if delta > _MAX_SINGLE_STEP:
                 # Jumped up too fast → battery replacement; reset everything
+                resolve_pending()
                 trough = None
                 cumulative_rise = 0.0
                 step_count = 0
@@ -121,6 +144,11 @@ def _is_rechargeable(values: list[float]) -> bool:
 
         # --- Open discharge gate: dropped MIN_DISCHARGE below local peak ---
         if peak - values[i] >= _MIN_DISCHARGE:
+            if trough is None:
+                # A prior rise (if any) has now conclusively ended — the peak
+                # variable above has kept tracking its true top since the
+                # cumulative/step gate first fired, so it's safe to judge now.
+                resolve_pending()
             if trough is None or values[i] < trough:
                 trough = values[i]
 
@@ -128,6 +156,7 @@ def _is_rechargeable(values: list[float]) -> bool:
         if trough is not None:
             if delta > _MAX_SINGLE_STEP:
                 # Instant jump → replacement, not recharge
+                resolve_pending()
                 trough = None
                 peak = values[i]
                 cumulative_rise = 0.0
@@ -136,7 +165,9 @@ def _is_rechargeable(values: list[float]) -> bool:
                 cumulative_rise += delta
                 step_count += 1
                 if cumulative_rise >= _MIN_CUMULATIVE and step_count >= _MIN_STEPS:
-                    charge_events += 1
+                    # Cycle qualifies on shape; defer the peak-height verdict
+                    # until we know how high this rise actually goes.
+                    pending = True
                     trough = None
                     peak = values[i]
                     cumulative_rise = 0.0
@@ -146,6 +177,7 @@ def _is_rechargeable(values: list[float]) -> bool:
                 cumulative_rise = 0.0
                 step_count = 0
 
+    resolve_pending()
     return charge_events >= 2
 
 
@@ -298,13 +330,13 @@ def derive_status(
     if category == CATEGORY_PLATEAU_CLIFF:
         return _status_plateau_cliff(current_value, values)
     if category == CATEGORY_LOW_STABLE:
-        return _status_low_stable(current_value, values)
+        return _status_low_stable(current_value, values, raw_points, now_ts=now_ts)
     if category == CATEGORY_VOLTAGE:
         return _status_voltage(current_value, values)
     if category == CATEGORY_RECHARGEABLE:
         return _status_rechargeable(current_value, raw_points, now_ts=now_ts)
     return _status_unknown_default(
-        current_value, is_binary, binary_low_is_critical
+        current_value, is_binary, binary_low_is_critical, raw_points, now_ts=now_ts
     )
 
 
@@ -412,15 +444,22 @@ def _status_plateau_cliff(
 def _status_low_stable(
     value: float | str | None,
     values: list[float],
+    raw_points: list[list[float]] | None = None,
+    *,
+    now_ts: float | None = None,
 ) -> str:
     if not isinstance(value, (int, float)) or len(values) < 5:
         return STATUS_NORMAL
+
+    representative = _representative_recent_value(
+        value, raw_points or [], now_ts=now_ts
+    )
 
     sorted_vals = sorted(values)
     idx_5 = max(0, int(len(sorted_vals) * 0.05))
     floor = sorted_vals[idx_5]
 
-    diff = floor - value
+    diff = floor - representative
     if diff <= 3:
         return STATUS_NORMAL
     if diff <= 10:
@@ -442,7 +481,13 @@ def _status_voltage(
     vmax = max(values)
     v_range = vmax - vmin
 
-    if v_range < 0.01:
+    # A range this small (relative to the voltage scale) is sensor noise or
+    # quantization, not a real discharge curve — e.g. a coin-cell sensor that
+    # only ever reports two values 12 mV apart. Treating it as a real signal
+    # would peg the status at whichever extreme the current value happens to
+    # sit at, often permanently.
+    min_range = max(VOLTAGE_MIN_RANGE_ABS, VOLTAGE_MIN_RANGE_RATIO * vmax)
+    if v_range < min_range:
         return STATUS_NORMAL
 
     pct = ((value - vmin) / v_range) * 100
@@ -489,6 +534,9 @@ def _status_unknown_default(
     value: float | str | None,
     is_binary: bool,
     binary_low_is_critical: bool,
+    raw_points: list[list[float]] | None = None,
+    *,
+    now_ts: float | None = None,
 ) -> str:
     if is_binary:
         if str(value) == "on":
@@ -498,10 +546,14 @@ def _status_unknown_default(
     if not isinstance(value, (int, float)):
         return STATUS_NORMAL
 
+    representative = _representative_recent_value(
+        value, raw_points or [], now_ts=now_ts
+    )
+
     warning_pct, critical_pct = DEFAULT_THRESHOLDS[CATEGORY_UNKNOWN_DEFAULT]
-    if value <= critical_pct:
+    if representative <= critical_pct:
         return STATUS_CRITICAL
-    if value <= warning_pct:
+    if representative <= warning_pct:
         return STATUS_WARNING
     return STATUS_NORMAL
 
@@ -509,6 +561,38 @@ def _status_unknown_default(
 # =====================================================================
 #  Shared helpers
 # =====================================================================
+
+
+def _representative_recent_value(
+    current_value: float,
+    raw_points: list[list[float]],
+    *,
+    window_hours: float = NOISE_SMOOTHING_WINDOW_HOURS,
+    percentile: float = NOISE_SMOOTHING_PERCENTILE,
+    now_ts: float | None = None,
+) -> float:
+    """A noise-robust stand-in for *current_value* for threshold comparisons.
+
+    Returns a high percentile of recent raw points instead of the single
+    latest reading, so a short-lived dip (e.g. a daily temperature-driven
+    sawtooth on an outdoor sensor) doesn't trigger warning/critical status
+    on its own, while a genuine sustained decline still pulls this value
+    down over time. Falls back to *current_value* when there isn't enough
+    recent history to smooth over.
+    """
+    if len(raw_points) < NOISE_SMOOTHING_MIN_POINTS:
+        return current_value
+
+    now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
+    cutoff = now - window_hours * 3600
+    window = [p[1] for p in raw_points if p[0] >= cutoff and p[1] is not None]
+
+    if len(window) < NOISE_SMOOTHING_MIN_POINTS:
+        return current_value
+
+    sorted_window = sorted(window)
+    idx = min(int(len(sorted_window) * percentile), len(sorted_window) - 1)
+    return sorted_window[idx]
 
 
 def estimate_remaining_days(

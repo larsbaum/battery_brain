@@ -60,6 +60,30 @@ PREDICTION_CRITICAL_DAYS = 2
 # --- Binary sensor thresholds (days) ---
 BINARY_CRITICAL_DAYS = 3
 
+# --- Voltage status: minimum meaningful observed range ---
+# A range smaller than this is treated as sensor noise/quantization rather
+# than a real discharge curve, and yields STATUS_NORMAL instead of a
+# (potentially permanent) false STATUS_CRITICAL.
+VOLTAGE_MIN_RANGE_ABS = 0.01  # volts
+VOLTAGE_MIN_RANGE_RATIO = 0.03  # fraction of the observed max voltage
+
+# --- Rechargeable detection: minimum peak height to count a charge cycle ---
+# A rise only counts as a genuine recharge if it reaches at least this
+# fraction of the all-time observed maximum, filtering out periodic
+# environmental artifacts (e.g. daily temperature swings) that never
+# approach the device's real "full" level.
+RECHARGE_MIN_PEAK_RATIO = 0.75
+
+# --- Status noise smoothing (low_stable / unknown_default) ---
+# Instead of comparing the single latest raw value against thresholds,
+# use a representative recent value (a high percentile over a trailing
+# window) so short-lived environmental noise doesn't trigger false
+# warning/critical status. Falls back to the raw current value when
+# there isn't enough recent history to smooth over.
+NOISE_SMOOTHING_WINDOW_HOURS = 36
+NOISE_SMOOTHING_PERCENTILE = 0.75
+NOISE_SMOOTHING_MIN_POINTS = 5
+
 # --- Storage ---
 STORAGE_KEY = DOMAIN
 STORAGE_VERSION = 1

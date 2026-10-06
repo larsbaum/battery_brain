@@ -11,10 +11,41 @@ und dem zugehörigen Git-Tag übereinstimmen (siehe SPEC.md §11).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-05
+
+### Added
+- Restlaufzeit-Schätzung für `rechargeable` (Regression über die aktuelle
+  Entladephase seit dem letzten Laden, bis 0 %; nur Anzeige, kein Einfluss auf
+  den Status) ([#2](https://github.com/larsbaum/battery_brain/issues/2)).
+- Restlaufzeit-Schätzung für `voltage` (Trend bis zur Spannung, bei der die
+  vorherige Batterie leer war) und `plateau_cliff` (Median-Lebensdauer früherer
+  Batterien minus Alter der aktuellen).
+- Neue Attribute `remaining_days` und `estimated_empty` pro Batterie in allen
+  Summary-Sensoren; `remaining_days` zusätzlich im `update`-Event des
+  Production- und Debug-Logs.
+
 ### Changed
 - Aufräumarbeiten: `manifest.json`-Version an den aktuellen Release-Stand
   angeglichen, `CHANGELOG.md` eingeführt, SPEC.md um einen verbindlichen
   Pflege-/Release-Prozess ergänzt. Keine funktionalen Änderungen.
+- `linear`: Die Restlaufzeit-Regression läuft jetzt über die Tagesmittel der
+  gesamten Lebensdauer der aktuellen Batterie (seit dem letzten Sprung > 20pp)
+  statt über ein 14-Tage-Fenster. Bei langsam entladenden Sensoren mit
+  1-%-Auflösung war die 14-Tage-Steigung reines Rauschen. Frisch getauschte
+  Batterien (< 7 Tage) nutzen weiter die Rohpunkte der letzten 14 Tage.
+  Die Status-Eskalation (< 7 bzw. < 2 Tage) nutzt dieselbe Schätzung.
+
+### Fixed
+- Die im README beworbene Restlaufzeit-Schätzung wurde zwar berechnet (für
+  `linear`), aber nirgends angezeigt: Das Ergebnis floss nur in die
+  Status-Ableitung ein und wurde dann verworfen.
+- README: Warnschwelle für `plateau_cliff` korrigiert (< 90 % statt < 95 %),
+  fehlende Option „Exclude integrations“ ergänzt, Speicherauflösung der
+  Rohpunkte korrigiert (bei Wertänderung statt stündlich).
+- Mindestversion von Home Assistant in `hacs.json` und README von 2024.6 auf
+  **2025.8** korrigiert. Die Integration nutzt `OptionsFlowWithReload` (seit
+  HA 2025.8) und `AddConfigEntryEntitiesCallback` (seit HA 2025.3) und ließ
+  sich auf älteren Versionen gar nicht laden.
 
 ## [0.1.4] - 2026-07-09
 
@@ -80,7 +111,8 @@ und dem zugehörigen Git-Tag übereinstimmen (siehe SPEC.md §11).
   Debug-Logging; Always-on Production-Logging (JSONL, 30 Tage Retention).
 - Einzelne Entities ausschließen (`OPT_EXCLUDE_ENTITIES`).
 
-[Unreleased]: https://github.com/larsbaum/battery_brain/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/larsbaum/battery_brain/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/larsbaum/battery_brain/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/larsbaum/battery_brain/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/larsbaum/battery_brain/compare/v0.1.2_BETA...v0.1.3
 [0.1.2]: https://github.com/larsbaum/battery_brain/compare/v0.1.1_BETA...v0.1.2_BETA

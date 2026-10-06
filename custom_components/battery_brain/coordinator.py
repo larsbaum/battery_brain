@@ -23,7 +23,12 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .analysis import check_stale, classify_battery, derive_status
+from .analysis import (
+    check_stale,
+    classify_battery,
+    derive_status,
+    estimate_remaining,
+)
 from .const import (
     CATEGORY_BINARY,
     CATEGORY_RECLASSIFY_INTERVAL,
@@ -64,6 +69,8 @@ class BatteryInfo:
     stale: bool = False
     is_binary: bool = False
     unit: str | None = None
+    remaining_days: float | None = None
+    estimated_empty: str | None = None
 
 
 @dataclass
@@ -223,6 +230,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 "status": info.status,
                 "confidence": info.confidence,
                 "stale": info.stale,
+                "remaining_days": info.remaining_days,
                 "is_binary": info.is_binary,
                 "unit": info.unit,
                 "history_days": round(
@@ -411,6 +419,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
                 "status": info.status,
                 "confidence": info.confidence,
                 "stale": info.stale,
+                "remaining_days": info.remaining_days,
                 "is_binary": info.is_binary,
                 "unit": info.unit,
                 "history_days": round(
@@ -555,6 +564,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self._classify_batteries(batteries)
         self._derive_all_status(batteries)
         self._apply_stale_overlay(batteries)
+        self._estimate_all_remaining(batteries)
         self._update_confidence(batteries)
         self._maybe_aggregate()
 
@@ -784,17 +794,58 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         info: BatteryInfo,
         binary_critical: bool,
     ) -> str:
-        values = self.store.get_all_values(entity_id)
+        all_points = self.store.get_all_points(entity_id)
         raw_points = self.store.get_raw_points(entity_id)
         return derive_status(
             info.category,
             info.last_value,
-            values,
+            [p[1] for p in all_points],
             raw_points,
             is_binary=info.is_binary,
             binary_low_is_critical=binary_critical,
             now_ts=self._get_now_ts(),
+            all_points=all_points,
         )
+
+    # ------------------------------------------------------------------
+    # Remaining-lifetime estimation
+    # ------------------------------------------------------------------
+
+    def _estimate_all_remaining(
+        self, batteries: dict[str, BatteryInfo]
+    ) -> None:
+        for entity_id, info in batteries.items():
+            self._estimate_single_remaining(entity_id, info)
+
+    def _estimate_single_remaining(
+        self, entity_id: str, info: BatteryInfo
+    ) -> None:
+        info.remaining_days = None
+        info.estimated_empty = None
+        if info.stale:
+            return
+
+        remaining = estimate_remaining(
+            info.category,
+            info.last_value,
+            self.store.get_raw_points(entity_id),
+            self.store.get_all_points(entity_id),
+            now_ts=self._get_now_ts(),
+        )
+        if remaining is None:
+            return
+
+        info.remaining_days = round(remaining, 1)
+        # remaining is in (possibly virtual) store time; convert to real time.
+        real_seconds = remaining * 86400
+        if self._test_mode_active:
+            real_seconds /= self._time_factor
+        try:
+            empty_at = dt_util.utcnow() + timedelta(seconds=real_seconds)
+        except OverflowError:
+            # Near-flat trend: beyond year 9999, no representable date.
+            return
+        info.estimated_empty = dt_util.as_local(empty_at).date().isoformat()
 
     # ------------------------------------------------------------------
     # Stale overlay
@@ -963,6 +1014,7 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         updated.status = self._derive_single_status(
             entity_id, updated, binary_critical
         )
+        self._estimate_single_remaining(entity_id, updated)
 
         old_state_obj = event.data.get("old_state")
         old_state_str = old_state_obj.state if old_state_obj else None

@@ -118,7 +118,11 @@ class BatteryHistoryStore:
 
     def get_all_values(self, entity_id: str) -> list[float]:
         """Return all known numeric values (raw + daily means) chronologically."""
-        values: list[tuple[float, float]] = []
+        return [v for _, v in self.get_all_points(entity_id)]
+
+    def get_all_points(self, entity_id: str) -> list[list[float]]:
+        """Return all known [ts, value] points (raw + daily means) chronologically."""
+        values: list[list[float]] = []
 
         for summary in self.get_daily_summaries(entity_id):
             ts = (
@@ -126,14 +130,14 @@ class BatteryHistoryStore:
                 .replace(tzinfo=timezone.utc)
                 .timestamp()
             )
-            values.append((ts, summary["mean"]))
+            values.append([ts, summary["mean"]])
 
         for point in self.get_raw_points(entity_id):
             if point[1] is not None:
-                values.append((point[0], point[1]))
+                values.append([point[0], point[1]])
 
         values.sort(key=lambda p: p[0])
-        return [v for _, v in values]
+        return values
 
     def get_last_seen_ts(self, entity_id: str) -> float | None:
         """Timestamp when the sensor was last observed alive by the coordinator."""

@@ -14,6 +14,13 @@ from .const import (
     CATEGORY_UNKNOWN_DEFAULT,
     CATEGORY_VOLTAGE,
     DEFAULT_THRESHOLDS,
+    ESTIMATE_LINEAR_MIN_DAYS,
+    ESTIMATE_MIN_POINTS,
+    ESTIMATE_MIN_SPAN_HOURS,
+    ESTIMATE_RECHARGE_RISE_TOL,
+    ESTIMATE_REPLACEMENT_JUMP,
+    ESTIMATE_VOLTAGE_RISE_RATIO,
+    ESTIMATE_WINDOW_DAYS,
     NOISE_SMOOTHING_MIN_POINTS,
     NOISE_SMOOTHING_PERCENTILE,
     NOISE_SMOOTHING_WINDOW_HOURS,
@@ -319,14 +326,21 @@ def derive_status(
     is_binary: bool = False,
     binary_low_is_critical: bool = False,
     now_ts: float | None = None,
+    all_points: list[list[float]] | None = None,
 ) -> str:
-    """Return normal / warning / critical for *current_value*."""
+    """Return normal / warning / critical for *current_value*.
+
+    *all_points* is the full [ts, value] history (daily means + raw points);
+    without it, linear predictions fall back to the recent raw points only.
+    """
     if category == CATEGORY_BINARY:
         return _status_binary(
             current_value, raw_points, binary_low_is_critical, now_ts=now_ts
         )
     if category == CATEGORY_LINEAR:
-        return _status_linear(current_value, raw_points, now_ts=now_ts)
+        return _status_linear(
+            current_value, raw_points, all_points, now_ts=now_ts
+        )
     if category == CATEGORY_PLATEAU_CLIFF:
         return _status_plateau_cliff(current_value, values)
     if category == CATEGORY_LOW_STABLE:
@@ -384,6 +398,7 @@ def _status_binary(
 def _status_linear(
     value: float | str | None,
     raw_points: list[list[float]],
+    all_points: list[list[float]] | None = None,
     *,
     now_ts: float | None = None,
 ) -> str:
@@ -397,7 +412,7 @@ def _status_linear(
     elif value <= warning_pct:
         status = STATUS_WARNING
 
-    remaining = estimate_remaining_days(raw_points, now_ts=now_ts)
+    remaining = _estimate_linear(raw_points, all_points, now_ts=now_ts)
     if remaining is not None:
         if remaining < PREDICTION_CRITICAL_DAYS:
             status = STATUS_CRITICAL
@@ -595,21 +610,197 @@ def _representative_recent_value(
     return sorted_window[idx]
 
 
-def estimate_remaining_days(
+# =====================================================================
+#  Remaining-lifetime estimation
+# =====================================================================
+
+
+def estimate_remaining(
+    category: str,
+    current_value: float | str | None,
+    raw_points: list[list[float]],
+    all_points: list[list[float]],
+    *,
+    now_ts: float | None = None,
+) -> float | None:
+    """Estimated days until the battery is empty, or None if not estimable.
+
+    *raw_points* are the recent full-resolution points, *all_points* the
+    complete chronological history (daily means + raw points) as [ts, value].
+    Only archetypes with a meaningful notion of "time until empty" get an
+    estimate: linear, rechargeable, voltage and plateau_cliff.
+    """
+    if not isinstance(current_value, (int, float)):
+        return None
+    if category == CATEGORY_LINEAR:
+        return _estimate_linear(raw_points, all_points, now_ts=now_ts)
+    if category == CATEGORY_RECHARGEABLE:
+        return _estimate_rechargeable(raw_points, now_ts=now_ts)
+    if category == CATEGORY_VOLTAGE:
+        return _estimate_voltage(all_points, now_ts=now_ts)
+    if category == CATEGORY_PLATEAU_CLIFF:
+        return _estimate_plateau_cliff(all_points, now_ts=now_ts)
+    return None
+
+
+def _estimate_linear(
+    raw_points: list[list[float]],
+    all_points: list[list[float]] | None = None,
+    *,
+    now_ts: float | None = None,
+) -> float | None:
+    """Trend over the whole life of the current battery, until 0%.
+
+    Slow linear drains change by only a few integer percent per month, so a
+    short window yields a noise-dominated slope. Instead, regress over daily
+    means since the last battery replacement (one point per day, so the
+    hourly raw points of the last 30 days don't outweigh older history).
+    Freshly replaced batteries without enough days fall back to the recent
+    raw points.
+    """
+    if all_points:
+        daily = _daily_means(all_points)
+        segment = daily[_trailing_segment_start(daily, ESTIMATE_REPLACEMENT_JUMP):]
+        if len(segment) >= ESTIMATE_LINEAR_MIN_DAYS:
+            return estimate_remaining_days(
+                segment, now_ts=now_ts, window_days=None
+            )
+    return estimate_remaining_days(
+        raw_points, now_ts=now_ts, segment_rise=ESTIMATE_REPLACEMENT_JUMP
+    )
+
+
+def _daily_means(points: list[list[float]]) -> list[list[float]]:
+    """Collapse [ts, value] points into one [mean ts, mean value] per UTC day."""
+    buckets: dict[int, list[list[float]]] = {}
+    for p in points:
+        if p[1] is not None:
+            buckets.setdefault(int(p[0] // 86400), []).append(p)
+    return [
+        [
+            sum(p[0] for p in day) / len(day),
+            sum(p[1] for p in day) / len(day),
+        ]
+        for _, day in sorted(buckets.items())
+    ]
+
+
+def _estimate_rechargeable(
     raw_points: list[list[float]], *, now_ts: float | None = None
 ) -> float | None:
-    """Linear-regression estimate of days until value reaches zero."""
+    # Regress over the current discharge phase only (since the last charge).
+    # While charging, the trailing phase is too short and this yields None.
+    return estimate_remaining_days(
+        raw_points, now_ts=now_ts, segment_rise=ESTIMATE_RECHARGE_RISE_TOL
+    )
+
+
+def _estimate_voltage(
+    all_points: list[list[float]], *, now_ts: float | None = None
+) -> float | None:
+    """Days until the voltage reaches the level the previous battery died at.
+
+    The "empty" voltage is the minimum observed *before* the current
+    discharge phase. Without a previous phase (first battery ever seen),
+    there is no known empty level, and the current value would trivially
+    be the minimum — so no estimate.
+    """
+    points = [p for p in all_points if p[1] is not None]
+    if len(points) < ESTIMATE_MIN_POINTS:
+        return None
+
+    vals = [p[1] for p in points]
+    vmax = max(vals)
+    v_range = vmax - min(vals)
+    if v_range < max(VOLTAGE_MIN_RANGE_ABS, VOLTAGE_MIN_RANGE_RATIO * vmax):
+        return None
+
+    rise_tol = ESTIMATE_VOLTAGE_RISE_RATIO * v_range
+    start = _trailing_segment_start(points, rise_tol)
+    if start == 0:
+        return None
+    floor = min(p[1] for p in points[:start])
+
+    return estimate_remaining_days(
+        points, now_ts=now_ts, floor=floor, segment_rise=rise_tol
+    )
+
+
+def _estimate_plateau_cliff(
+    all_points: list[list[float]], *, now_ts: float | None = None
+) -> float | None:
+    """Expected lifetime from past replacement intervals minus current age.
+
+    Plateau batteries give no usable trend before they fall off the cliff,
+    so the only signal is how long previous batteries in this device lasted.
+    Needs at least two observed replacements (= one complete lifetime).
+    """
+    points = [p for p in all_points if p[1] is not None]
+    replacements = [
+        points[i][0]
+        for i in range(1, len(points))
+        if points[i][1] - points[i - 1][1] > ESTIMATE_REPLACEMENT_JUMP
+    ]
+    if len(replacements) < 2:
+        return None
+
+    lifetimes = [
+        (replacements[i] - replacements[i - 1]) / 86400
+        for i in range(1, len(replacements))
+    ]
+    now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
+    age = (now - replacements[-1]) / 86400
+    return max(_median(lifetimes) - age, 0.0)
+
+
+def _trailing_segment_start(
+    points: list[tuple[float, float]] | list[list[float]], rise_tol: float
+) -> int:
+    """Index where the trailing discharge phase starts.
+
+    Walks backwards from the end and stops at the last upward step larger
+    than *rise_tol* (a recharge or replacement).
+    """
+    for i in range(len(points) - 1, 0, -1):
+        if points[i][1] - points[i - 1][1] > rise_tol:
+            return i
+    return 0
+
+
+def estimate_remaining_days(
+    raw_points: list[list[float]],
+    *,
+    now_ts: float | None = None,
+    floor: float = 0.0,
+    segment_rise: float | None = None,
+    window_days: float | None = ESTIMATE_WINDOW_DAYS,
+) -> float | None:
+    """Linear-regression estimate of days until value reaches *floor*.
+
+    Uses the last *window_days* of points (all points if None). With
+    *segment_rise*, only
+    the trailing discharge phase (after the last upward step larger than
+    *segment_rise*) is used, and it must span at least
+    ESTIMATE_MIN_SPAN_HOURS.
+    """
     if len(raw_points) < 3:
         return None
 
     now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
-    cutoff = now - 14 * 86400
+    cutoff = now - window_days * 86400 if window_days is not None else 0.0
     recent = [
         (p[0], p[1])
         for p in raw_points
         if p[0] >= cutoff and p[1] is not None
     ]
-    if len(recent) < 3:
+    if segment_rise is not None:
+        recent = recent[_trailing_segment_start(recent, segment_rise):]
+        if (
+            len(recent) >= 2
+            and recent[-1][0] - recent[0][0] < ESTIMATE_MIN_SPAN_HOURS * 3600
+        ):
+            return None
+    if len(recent) < ESTIMATE_MIN_POINTS:
         return None
 
     n = len(recent)
@@ -627,12 +818,12 @@ def estimate_remaining_days(
         return None
 
     intercept = (sy - slope * sx) / n
-    current_est = slope * now + intercept
+    headroom = slope * now + intercept - floor
 
-    if current_est <= 0:
+    if headroom <= 0:
         return 0.0
 
-    return (-current_est / slope) / 86400
+    return (-headroom / slope) / 86400
 
 
 def _estimate_charge_cycle_days(raw_points: list[list[float]]) -> float:

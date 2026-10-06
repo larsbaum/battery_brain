@@ -18,7 +18,7 @@
 - **Behavioral classification** — categorizes batteries into 7 archetypes based on their actual drain patterns, not just a percentage
 - **Smart health status** — each battery gets a **Normal** / **Warning** / **Critical** status using category-specific thresholds
 - **Stale detection** — flags batteries that stop reporting
-- **Remaining lifetime estimation** — for linear-drain batteries
+- **Remaining lifetime estimation** — estimated days until empty for linear, rechargeable, voltage and plateau-cliff batteries
 - **History seeding** — imports up to 1 year of existing data from the HA recorder on first setup, so classification starts immediately
 - **Summary sensors** — ready-made sensors for dashboards and automations
 
@@ -67,7 +67,7 @@ BatteryBrain creates four summary sensors:
 
 | Entity | State | Attributes |
 |---|---|---|
-| `sensor.battery_brain_all_batteries` | Total number of monitored batteries | Per-battery details (category, status, value, confidence, stale) |
+| `sensor.battery_brain_all_batteries` | Total number of monitored batteries | Per-battery details (category, status, value, confidence, stale, remaining lifetime) |
 | `sensor.battery_brain_batteries_normal` | Count of healthy batteries | List of battery names and details |
 | `sensor.battery_brain_batteries_warning` | Count of batteries needing attention | List of battery names and details |
 | `sensor.battery_brain_batteries_critical` | Count of batteries needing replacement | List of battery names and details |
@@ -78,6 +78,8 @@ Each sensor carries **detailed attributes** for every battery in its group, incl
 - `last_value` — last reported battery level
 - `confidence` — classification confidence (`default` / `low` / `medium` / `high`)
 - `stale` — whether the battery has stopped reporting
+- `remaining_days` — estimated days until the battery is empty, or `null` if no estimate is possible (see *Remaining Lifetime Estimation* below)
+- `estimated_empty` — the estimated date the battery will be empty (`YYYY-MM-DD`), or `null`
 - `source_entity` — the original entity ID
 
 Use these attributes to build detailed dashboards or trigger automations.
@@ -92,6 +94,7 @@ Access via **Settings > Devices & Services > BatteryBrain > Configure**:
 |---|---|---|
 | Scan for `battery_level` attributes | Off | Also monitor entities that report battery level as an attribute instead of a dedicated sensor |
 | Treat binary low-battery as critical | Off | Escalate binary battery sensors directly to critical instead of warning |
+| Exclude integrations | — | Exclude all battery entities of one or more integrations (e.g. `mobile_app`) |
 | Exclude entities | — | Select specific entities to exclude from monitoring |
 | Developer Mode | Off | Enables debug logging and developer tools (see below) |
 
@@ -109,7 +112,7 @@ BatteryBrain classifies each battery into one of 7 archetypes based on its behav
 | **Low-Stable** | Sensors reporting 1% for months | Persistently low values with minimal variation |
 | **Voltage** | Sensors reporting in V/mV instead of % | Detected by unit or value range (0.3 V – 20 V) |
 | **Binary** | Simple low/normal battery indicators | Binary sensor with `device_class: battery` |
-| **Unknown** | New batteries, insufficient data | Fallback until 7+ days of data are available |
+| **Unknown** | New batteries, devices kept in a narrow charge window | Fallback: fewer than 7 days of data, or no pattern above matches |
 
 ---
 
@@ -354,7 +357,7 @@ Every 5 minutes, BatteryBrain scans all entities for:
 <summary><strong>History & Storage</strong></summary>
 
 - On first discovery, imports up to **365 days** of history from the HA recorder (Long-Term Statistics first, raw states as fallback)
-- Stores the last **30 days** of raw data points (hourly resolution)
+- Stores the last **30 days** of raw data points (every value change; imported history at hourly resolution)
 - Aggregates older data into **daily summaries** (up to 365 days)
 - All data is stored locally in `.storage/battery_brain` — independent of the HA recorder
 
@@ -384,8 +387,8 @@ Each archetype has its own thresholds:
 
 | Archetype | Warning | Critical |
 |---|---|---|
-| Linear | &le; 20% | &le; 10% |
-| Plateau-Cliff | &lt; 95% of plateau | &lt; 70% of plateau |
+| Linear | &le; 20%, or empty in &lt; 7 days | &le; 10%, or empty in &lt; 2 days |
+| Plateau-Cliff | &lt; 90% of plateau | &lt; 70% of plateau, or a sudden drop of &gt; 30% |
 | Rechargeable | &le; 15% | &le; 5% |
 | Low-Stable | Deviation from stable floor | Large deviation from floor |
 | Voltage | &le; 25% of range | &le; 10% of range |
@@ -394,11 +397,30 @@ Each archetype has its own thresholds:
 
 </details>
 
+<details>
+<summary><strong>Remaining Lifetime Estimation</strong></summary>
+
+How `remaining_days` is estimated depends on the archetype:
+
+| Archetype | Method |
+|---|---|
+| Linear | Linear trend over daily averages since the last battery replacement until 0% (for batteries replaced less than 7 days ago: the last 14 days of raw readings) |
+| Rechargeable | Linear trend over the current discharge phase (since the last charge) until 0%. `null` while charging |
+| Voltage | Linear trend over the current discharge phase until the voltage at which the previous battery died. `null` until at least one battery replacement has been observed |
+| Plateau-Cliff | Median lifetime of previous batteries in this device minus the age of the current one. `null` until at least two replacements have been observed |
+| Low-Stable, Binary, Unknown | No estimate (`null`) |
+
+Stale batteries never get an estimate. For linear batteries, a predicted lifetime below 7 days raises the status to Warning and below 2 days to Critical. For all other archetypes the estimate is informational only.
+
+Very slowly draining batteries can show large values (several years) — that simply means the trend is nearly flat. Devices that are kept in a narrow charge window (e.g. a wall tablet held between 40% and 60% by an automation) are not classified as rechargeable and get no estimate, since they never run empty.
+
+</details>
+
 ---
 
 ## Requirements
 
-- **Home Assistant** 2024.6 or newer
+- **Home Assistant** 2025.8 or newer
 - **HACS** (for easy installation — manual install also works)
 - The **Recorder** integration must be enabled (it is by default)
 

@@ -57,6 +57,24 @@ DEFAULT_THRESHOLDS: dict[str, tuple[float, float]] = {
 PREDICTION_WARNING_DAYS = 7
 PREDICTION_CRITICAL_DAYS = 2
 
+# --- Remaining-lifetime estimation ---
+# Trend regression only looks at this many trailing days of raw points.
+ESTIMATE_WINDOW_DAYS = 14
+# A single upward step larger than this (pp) is a battery replacement.
+ESTIMATE_REPLACEMENT_JUMP = 20.0
+# Rechargeables: an upward step larger than this (pp) ends the current
+# discharge phase (charging); smaller rises are treated as noise.
+ESTIMATE_RECHARGE_RISE_TOL = 2.0
+# Voltage: an upward step larger than this fraction of the observed
+# voltage range ends the current discharge phase (replacement/recharge).
+ESTIMATE_VOLTAGE_RISE_RATIO = 0.2
+# Linear: minimum days of history since the last replacement before the
+# long-term (daily-mean) regression is used instead of the 14-day window.
+ESTIMATE_LINEAR_MIN_DAYS = 7
+# Minimum size of the discharge phase used for a regression.
+ESTIMATE_MIN_POINTS = 3
+ESTIMATE_MIN_SPAN_HOURS = 1.0
+
 # --- Binary sensor thresholds (days) ---
 BINARY_CRITICAL_DAYS = 3
 

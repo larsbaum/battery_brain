@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
@@ -15,9 +17,26 @@ from .const import (
     STATUS_NORMAL,
     STATUS_WARNING,
 )
-from .coordinator import BatteryBrainCoordinator, BatteryBrainData
+from .coordinator import BatteryBrainCoordinator, BatteryBrainData, BatteryInfo
 
 PARALLEL_UPDATES = 0
+
+
+def _battery_attrs(batteries: Iterable[BatteryInfo]) -> dict[str, dict]:
+    """Per-battery detail dict exposed as extra state attributes."""
+    return {
+        info.name: {
+            "category": info.category,
+            "status": info.status,
+            "last_value": info.last_value,
+            "confidence": info.confidence,
+            "stale": info.stale,
+            "remaining_days": info.remaining_days,
+            "estimated_empty": info.estimated_empty,
+            "source_entity": info.source_entity,
+        }
+        for info in batteries
+    }
 
 
 async def async_setup_entry(
@@ -75,17 +94,7 @@ class BatteriesNormalSensor(BatteryBrainSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, dict]:
-        attrs: dict[str, dict] = {}
-        for info in self._data.normal:
-            attrs[info.name] = {
-                "category": info.category,
-                "status": info.status,
-                "last_value": info.last_value,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "source_entity": info.source_entity,
-            }
-        return attrs
+        return _battery_attrs(self._data.normal)
 
 
 class BatteriesWarningSensor(BatteryBrainSensor):
@@ -104,17 +113,7 @@ class BatteriesWarningSensor(BatteryBrainSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, dict]:
-        attrs: dict[str, dict] = {}
-        for info in self._data.warning:
-            attrs[info.name] = {
-                "category": info.category,
-                "status": info.status,
-                "last_value": info.last_value,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "source_entity": info.source_entity,
-            }
-        return attrs
+        return _battery_attrs(self._data.warning)
 
 
 class BatteriesCriticalSensor(BatteryBrainSensor):
@@ -133,17 +132,7 @@ class BatteriesCriticalSensor(BatteryBrainSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, dict]:
-        attrs: dict[str, dict] = {}
-        for info in self._data.critical:
-            attrs[info.name] = {
-                "category": info.category,
-                "status": info.status,
-                "last_value": info.last_value,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "source_entity": info.source_entity,
-            }
-        return attrs
+        return _battery_attrs(self._data.critical)
 
 
 class AllBatteriesSensor(BatteryBrainSensor):
@@ -162,14 +151,4 @@ class AllBatteriesSensor(BatteryBrainSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, dict]:
-        attrs: dict[str, dict] = {}
-        for info in self._data.batteries.values():
-            attrs[info.name] = {
-                "category": info.category,
-                "status": info.status,
-                "last_value": info.last_value,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "source_entity": info.source_entity,
-            }
-        return attrs
+        return _battery_attrs(self._data.batteries.values())

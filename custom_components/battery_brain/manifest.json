@@ -1,13 +1,15 @@
 {
   "domain": "battery_brain",
   "name": "BatteryBrain",
+  "after_dependencies": ["frontend"],
   "codeowners": ["@larsbaum"],
   "config_flow": true,
-  "dependencies": ["recorder"],
+  "dependencies": ["http", "recorder"],
   "documentation": "https://github.com/larsbaum/battery_brain",
   "integration_type": "service",
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/larsbaum/battery_brain/issues",
   "requirements": [],
-  "version": "0.2.0"
+  "single_config_entry": true,
+  "version": "1.0.0"
 }

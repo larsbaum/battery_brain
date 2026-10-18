@@ -1,0 +1,106 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "BatteryBrain einrichten",
+        "description": "BatteryBrain findet automatisch alle Batterien in Home Assistant, lernt, wie sich jede einzelne entlädt, und zeigt dir, welche Aufmerksamkeit brauchen – inklusive einer Schätzung, wann sie leer sind.\n\nEs sind keine Einstellungen nötig. Vorhandene Historie wird aus dem Recorder übernommen, sodass die meisten Batterien sofort bewertet werden. Feineinstellungen findest du später unter **Konfigurieren**."
+      }
+    },
+    "abort": {
+      "already_configured": "BatteryBrain ist bereits eingerichtet.",
+      "single_instance_allowed": "BatteryBrain ist bereits eingerichtet."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "BatteryBrain-Optionen",
+        "description": "Änderungen gelten sofort; die gesammelte Historie bleibt erhalten.",
+        "sections": {
+          "discovery": {
+            "name": "Erkennung",
+            "description": "Welche Entitäten als Batterie gelten. Sensoren und Binärsensoren mit der Geräteklasse Batterie sind immer dabei.",
+            "data": {
+              "scan_battery_level_attr": "battery_level-Attribute einbeziehen",
+              "include_voltage_sensors": "Spannungssensoren einbeziehen"
+            },
+            "data_description": {
+              "scan_battery_level_attr": "Auch Entitäten überwachen, die ihre Batterie nur als Attribut battery_level melden (z. B. manche Device-Tracker).",
+              "include_voltage_sensors": "Spannungssensoren zwischen 0,3 V und 20 V als Batterien überwachen. Ausschalten, wenn Spannungen ohne Batterie auftauchen (z. B. die 3,3-V-Versorgung eines ESP-Boards)."
+            }
+          },
+          "exclusions": {
+            "name": "Ausschlüsse",
+            "description": "Batterien, die nicht überwacht werden sollen.",
+            "data": {
+              "exclude_integrations": "Ausgeschlossene Integrationen",
+              "exclude_entities": "Ausgeschlossene Batterien"
+            },
+            "data_description": {
+              "exclude_integrations": "Alle Batterien dieser Integrationen ignorieren (z. B. Mobile App für Handys).",
+              "exclude_entities": "Einzelne Batterien ignorieren."
+            }
+          },
+          "alerts": {
+            "name": "Bewertung",
+            "description": "Wie Batteriezustände eingestuft werden.",
+            "data": {
+              "alert_mode": "Bewertungsmodus",
+              "warning_threshold": "Warnen ab",
+              "binary_low_is_critical": "Niedrig-Signal von Ein/Aus-Batteriesensoren ist kritisch"
+            },
+            "data_description": {
+              "alert_mode": "Intelligent: Jede Batterie wird nach ihrem Entladeverhalten bewertet, inklusive einer Prognose, wann sie leer ist. Nur bei niedrigem Stand: Eine Batterie wird erst ab dem Wert unten zur Warnung und ab der Hälfte davon kritisch. Prognosen bleiben in den Attributen sichtbar.",
+              "warning_threshold": "Gilt nur für „Nur bei niedrigem Stand“. Spannungs- und Ein/Aus-Batteriesensoren sowie nicht erreichbare Batterien werden in beiden Modi gleich bewertet.",
+              "binary_low_is_critical": "Batteriesensoren, die nur niedrig/normal melden, gelten sofort als kritisch, wenn sie niedrig melden. Sonst sind sie zuerst eine Warnung und nach 3 Tagen kritisch."
+            }
+          },
+          "advanced": {
+            "name": "Erweitert",
+            "description": "Nur zur Fehlersuche.",
+            "data": {
+              "developer_mode": "Entwicklermodus"
+            },
+            "data_description": {
+              "developer_mode": "Schreibt ein ausführliches Debug-Log und fügt Entwicklerwerkzeuge hinzu. Nur einschalten, wenn du für eine Fehleranalyse darum gebeten wirst."
+            }
+          }
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "batteries_normal": {
+        "name": "Batterien normal"
+      },
+      "batteries_warning": {
+        "name": "Batterien Warnung"
+      },
+      "batteries_critical": {
+        "name": "Batterien kritisch"
+      },
+      "all_batteries": {
+        "name": "Alle Batterien"
+      }
+    },
+    "switch": {
+      "test_mode": {
+        "name": "Testmodus (NICHT BENUTZEN – zerstört Sensordaten)"
+      }
+    },
+    "button": {
+      "reclassify": {
+        "name": "Batterien neu klassifizieren"
+      }
+    }
+  },
+  "selector": {
+    "alert_mode": {
+      "options": {
+        "smart": "Intelligent (vorausschauend)",
+        "threshold": "Nur bei niedrigem Stand"
+      }
+    }
+  }
+}

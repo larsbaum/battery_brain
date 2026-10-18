@@ -3,40 +3,68 @@
     "step": {
       "user": {
         "title": "Set up BatteryBrain",
-        "description": "BatteryBrain automatically discovers all battery entities and monitors their health.",
-        "data": {
-          "scan_battery_level_attr": "Scan for battery_level attributes",
-          "binary_low_is_critical": "Treat binary low-battery as critical",
-          "developer_mode": "Enable developer mode"
-        },
-        "data_description": {
-          "scan_battery_level_attr": "Also monitor entities that expose a battery_level attribute, even without the battery device class.",
-          "binary_low_is_critical": "Mark binary battery sensors as critical instead of warning when they report low.",
-          "developer_mode": "The use of this mode is not recommended. Enable it only if explicitly requested by the developer for error analysis purposes."
-        }
+        "description": "BatteryBrain automatically finds all batteries in Home Assistant, learns how each one drains and tells you which ones need attention — including an estimate of when they will be empty.\n\nNo settings are needed. Existing history is imported from the recorder, so most batteries are evaluated right away. You can fine-tune everything later under **Configure**."
       }
     },
     "abort": {
-      "already_configured": "BatteryBrain is already configured."
+      "already_configured": "BatteryBrain is already set up.",
+      "single_instance_allowed": "BatteryBrain is already set up."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "BatteryBrain Options",
-        "data": {
-          "exclude_integrations": "Excluded integrations",
-          "scan_battery_level_attr": "Scan for battery_level attributes",
-          "binary_low_is_critical": "Treat binary low-battery as critical",
-          "exclude_entities": "Excluded entities",
-          "developer_mode": "Enable developer mode"
-        },
-        "data_description": {
-          "exclude_integrations": "Exclude all battery entities from selected integrations at once.",
-          "scan_battery_level_attr": "Also monitor entities that expose a battery_level attribute, even without the battery device class.",
-          "binary_low_is_critical": "Mark binary battery sensors as critical instead of warning when they report low.",
-          "exclude_entities": "Select entities to exclude from battery monitoring.",
-          "developer_mode": "The use of this mode is not recommended. Enable it only if explicitly requested by the developer for error analysis purposes."
+        "title": "BatteryBrain options",
+        "description": "Changes apply immediately; collected history is kept.",
+        "sections": {
+          "discovery": {
+            "name": "Discovery",
+            "description": "Which entities count as batteries. Sensors and binary sensors with the battery device class are always included.",
+            "data": {
+              "scan_battery_level_attr": "Include battery_level attributes",
+              "include_voltage_sensors": "Include voltage sensors"
+            },
+            "data_description": {
+              "scan_battery_level_attr": "Also monitor entities that only report their battery as a battery_level attribute (e.g. some device trackers).",
+              "include_voltage_sensors": "Monitor voltage sensors between 0.3 V and 20 V as batteries. Turn off if non-battery voltages (e.g. a 3.3 V supply of an ESP board) show up."
+            }
+          },
+          "exclusions": {
+            "name": "Exclusions",
+            "description": "Batteries you don't want to monitor.",
+            "data": {
+              "exclude_integrations": "Excluded integrations",
+              "exclude_entities": "Excluded batteries"
+            },
+            "data_description": {
+              "exclude_integrations": "Ignore all batteries of these integrations (e.g. Mobile App for phones).",
+              "exclude_entities": "Ignore individual batteries."
+            }
+          },
+          "alerts": {
+            "name": "Alerts",
+            "description": "How battery states are rated.",
+            "data": {
+              "alert_mode": "Alert mode",
+              "warning_threshold": "Warn at or below",
+              "binary_low_is_critical": "Low signal of on/off battery sensors is critical"
+            },
+            "data_description": {
+              "alert_mode": "Smart: each battery is rated by how it drains, including a forecast of when it will be empty. Low level only: a battery only becomes a warning at or below the level below, and critical at half of it. Forecasts are still shown in the attributes.",
+              "warning_threshold": "Only used with \"Low level only\". Voltage and on/off battery sensors and unreachable batteries are rated the same in both modes.",
+              "binary_low_is_critical": "Battery sensors that only report low/normal count as critical as soon as they report low. Otherwise they are a warning first and critical after 3 days."
+            }
+          },
+          "advanced": {
+            "name": "Advanced",
+            "description": "For troubleshooting only.",
+            "data": {
+              "developer_mode": "Developer mode"
+            },
+            "data_description": {
+              "developer_mode": "Writes a detailed debug log and adds developer tools. Only enable this when asked to for an error analysis."
+            }
+          }
         }
       }
     }
@@ -64,6 +92,14 @@
     "button": {
       "reclassify": {
         "name": "Reclassify Batteries"
+      }
+    }
+  },
+  "selector": {
+    "alert_mode": {
+      "options": {
+        "smart": "Smart (predictive)",
+        "threshold": "Low level only"
       }
     }
   }

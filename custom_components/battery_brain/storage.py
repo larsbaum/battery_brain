@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
+from .analysis import merge_replacement_events
 from .const import (
     HISTORY_MAX_DAYS,
     HISTORY_RAW_DAYS,
@@ -19,11 +20,28 @@ from .const import (
     STORAGE_VERSION,
 )
 
-SAVE_DELAY = 300
+# Like HA's restore_state: at most 15 min of data is lost on a crash, while a
+# large store (hundreds of batteries) isn't rewritten every few minutes.
+SAVE_DELAY = 900
+# Decimals kept for imported means and daily means (more is just noise).
+VALUE_DECIMALS = 3
+# Persisted replacement events per battery (oldest are dropped).
+MAX_REPLACEMENTS = 20
+
+# Where a battery's values come from (stored as "source").
+SOURCE_STATE = "state"
+SOURCE_ATTRIBUTE = "attribute"
 
 
 class BatteryHistoryStore:
-    """Per-battery history with JSON persistence via HA Store."""
+    """Per-battery history with JSON persistence via HA Store.
+
+    Layout per battery (all fields optional when loading older data):
+    raw_points [[ts, value], …] of the last HISTORY_RAW_DAYS, daily_summaries
+    for older data, first_seen/last_seen, seeded, source, category,
+    last_classified, pending_category/pending_count (classification
+    hysteresis) and replacements (timestamps, kept beyond the history).
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
@@ -31,7 +49,10 @@ class BatteryHistoryStore:
             hass, STORAGE_VERSION, STORAGE_KEY
         )
         self._data: dict[str, dict[str, Any]] = {}
+        # Unused since 1.0 (test-mode state); kept so the file round-trips.
         self._meta: dict[str, Any] = {}
+        # A delayed write is already scheduled (see _schedule_save).
+        self._save_pending = False
 
     async def async_load(self) -> None:
         """Load stored history from .storage/."""
@@ -44,6 +65,17 @@ class BatteryHistoryStore:
             self._meta = {}
 
     def _schedule_save(self) -> None:
+        """Write at most SAVE_DELAY after the first unsaved change.
+
+        Store.async_delay_save() moves a pending write to "now + delay" on
+        every call. Batteries report all the time, so calling it on each
+        change would postpone the write until shutdown — a crash or power
+        cut would lose everything since the last restart. Only the first
+        change after a write schedules one.
+        """
+        if self._save_pending:
+            return
+        self._save_pending = True
         self._store.async_delay_save(self._serialize, SAVE_DELAY)
 
     async def async_save_immediate(self) -> None:
@@ -51,27 +83,19 @@ class BatteryHistoryStore:
         await self._store.async_save(self._serialize())
 
     def _serialize(self) -> dict[str, Any]:
+        # Called when the data is actually written (delayed or immediate):
+        # later changes need a new write.
+        self._save_pending = False
         return {"batteries": self._data, "meta": self._meta}
 
-    # --- Global meta (test mode state, etc.) ---
-
-    def get_meta(self, key: str, default: Any = None) -> Any:
-        return self._meta.get(key, default)
-
-    def set_meta(self, key: str, value: Any) -> None:
-        self._meta[key] = value
-        self._schedule_save()
+    def as_dict(self) -> dict[str, dict[str, Any]]:
+        """All stored battery data (read-only use, e.g. diagnostics)."""
+        return self._data
 
     # --- Query helpers ---
 
-    def get_battery_data(self, entity_id: str) -> dict[str, Any] | None:
-        return self._data.get(entity_id)
-
-    def has_history(self, entity_id: str) -> bool:
-        data = self._data.get(entity_id)
-        if not data:
-            return False
-        return bool(data.get("raw_points")) or bool(data.get("daily_summaries"))
+    def has_battery(self, entity_id: str) -> bool:
+        return entity_id in self._data
 
     def is_seeded(self, entity_id: str) -> bool:
         data = self._data.get(entity_id)
@@ -102,13 +126,7 @@ class BatteryHistoryStore:
 
         summaries = data.get("daily_summaries", [])
         if summaries:
-            oldest_str = min(s["date"] for s in summaries)
-            oldest_ts = (
-                datetime.strptime(oldest_str, "%Y-%m-%d")
-                .replace(tzinfo=timezone.utc)
-                .timestamp()
-            )
-            first = min(first, oldest_ts)
+            first = min(first, _date_ts(min(s["date"] for s in summaries)))
 
         raw = data.get("raw_points", [])
         if raw:
@@ -122,22 +140,23 @@ class BatteryHistoryStore:
 
     def get_all_points(self, entity_id: str) -> list[list[float]]:
         """Return all known [ts, value] points (raw + daily means) chronologically."""
-        values: list[list[float]] = []
-
-        for summary in self.get_daily_summaries(entity_id):
-            ts = (
-                datetime.strptime(summary["date"], "%Y-%m-%d")
-                .replace(tzinfo=timezone.utc)
-                .timestamp()
-            )
-            values.append([ts, summary["mean"]])
-
-        for point in self.get_raw_points(entity_id):
-            if point[1] is not None:
-                values.append([point[0], point[1]])
-
+        values: list[list[float]] = [
+            [_date_ts(summary["date"]), summary["mean"]]
+            for summary in self.get_daily_summaries(entity_id)
+        ]
+        values.extend(
+            [point[0], point[1]]
+            for point in self.get_raw_points(entity_id)
+            if point[1] is not None
+        )
         values.sort(key=lambda p: p[0])
         return values
+
+    def get_first_seen(self, entity_id: str) -> float | None:
+        data = self._data.get(entity_id)
+        if not data:
+            return None
+        return data.get("first_seen")
 
     def get_last_seen_ts(self, entity_id: str) -> float | None:
         """Timestamp when the sensor was last observed alive by the coordinator."""
@@ -161,16 +180,6 @@ class BatteryHistoryStore:
         if raw:
             return raw[-1][0]
         return data.get("first_seen")
-
-    def get_recent_points(
-        self, entity_id: str, days: int = 7, *, now_ts: float | None = None
-    ) -> list[list[float]]:
-        """Raw points from the last N days."""
-        now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
-        cutoff = now - days * 86400
-        return [
-            p for p in self.get_raw_points(entity_id) if p[0] >= cutoff
-        ]
 
     def get_median_interval(self, entity_id: str) -> float | None:
         """Median reporting interval in seconds, or None if < 3 points."""
@@ -214,6 +223,62 @@ class BatteryHistoryStore:
         )
         self._schedule_save()
 
+    def get_pending_category(self, entity_id: str) -> tuple[str | None, int]:
+        """Category waiting for confirmation and how often it was seen."""
+        data = self._data.get(entity_id) or {}
+        return data.get("pending_category"), data.get("pending_count", 0)
+
+    def set_pending_category(
+        self, entity_id: str, category: str | None, count: int = 0
+    ) -> None:
+        data = self._ensure_battery(entity_id)
+        if category is None:
+            if data.pop("pending_category", None) is None:
+                return
+            data.pop("pending_count", None)
+        else:
+            data["pending_category"] = category
+            data["pending_count"] = count
+        self._schedule_save()
+
+    # --- Replacement events ---
+
+    def get_replacements(self, entity_id: str) -> list[float]:
+        data = self._data.get(entity_id)
+        if not data:
+            return []
+        return data.get("replacements", [])
+
+    def sync_replacements(
+        self,
+        entity_id: str,
+        detected: list[float] | None,
+        history_start: float,
+    ) -> None:
+        """Remember replacement events so they outlive the history pruning.
+
+        Within the stored history (from *history_start*) only the *detected*
+        events count, which also drops wrongly stored ones (charge bursts,
+        solar spikes stored before 1.0 checked them). Older events are kept.
+        None means this battery doesn't have replacements (e.g. it is
+        recharged), and clears the list.
+        """
+        data = self._data.get(entity_id)
+        if data is None:
+            return
+        known = data.get("replacements", [])
+        if detected is None:
+            merged: list[float] = []
+        else:
+            older = [ts for ts in known if ts < history_start]
+            merged = merge_replacement_events(older, detected)[-MAX_REPLACEMENTS:]
+        if merged != known:
+            if merged:
+                data["replacements"] = merged
+            else:
+                data.pop("replacements", None)
+            self._schedule_save()
+
     # --- Mutation ---
 
     def _ensure_battery(
@@ -231,6 +296,44 @@ class BatteryHistoryStore:
                 "seeded": False,
             }
         return self._data[entity_id]
+
+    def ensure_source(
+        self, entity_id: str, source: str, *, now_ts: float | None = None
+    ) -> bool:
+        """Record where the values come from; reset the history if it changed.
+
+        Before 1.0, batteries read from a ``battery_level`` attribute also
+        stored the host entity's state (e.g. a temperature) and imported its
+        recorder history. Such legacy entries (no source yet) are reset once.
+        Returns True if the history was reset.
+        """
+        data = self._data.get(entity_id)
+        if data is None:
+            return False
+        stored = data.get("source")
+        if stored == source:
+            return False
+        reset = stored is not None or source == SOURCE_ATTRIBUTE
+        if reset:
+            ts = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
+            for key in (
+                "category",
+                "last_classified",
+                "pending_category",
+                "pending_count",
+                "replacements",
+            ):
+                data.pop(key, None)
+            data.update(
+                raw_points=[],
+                daily_summaries=[],
+                first_seen=ts,
+                last_seen=ts,
+                seeded=True,
+            )
+        data["source"] = source
+        self._schedule_save()
+        return reset
 
     def add_point(
         self, entity_id: str, timestamp: float, value: float | None
@@ -270,78 +373,91 @@ class BatteryHistoryStore:
         self._data[entity_id]["seeded"] = True
         self._schedule_save()
 
-    def remove_battery(self, entity_id: str) -> None:
-        if entity_id in self._data:
-            del self._data[entity_id]
-            self._schedule_save()
-
     # --- Aggregation ---
 
     def aggregate(self, *, now_ts: float | None = None) -> None:
-        """Promote raw points older than 30d to daily summaries, prune >365d."""
+        """Promote raw points older than 30 d to daily summaries, prune > 365 d.
+
+        Batteries without any data left whose entity hasn't been seen for
+        HISTORY_MAX_DAYS are dropped entirely.
+        """
         now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
         cutoff_raw = now - HISTORY_RAW_DAYS * 86400
+        cutoff_max = now - HISTORY_MAX_DAYS * 86400
         cutoff_max_str = datetime.fromtimestamp(
-            now - HISTORY_MAX_DAYS * 86400, tz=timezone.utc
+            cutoff_max, tz=timezone.utc
         ).strftime("%Y-%m-%d")
         dirty = False
 
-        for data in self._data.values():
+        for entity_id in list(self._data):
+            data = self._data[entity_id]
             raw = data.get("raw_points", [])
-            if not raw:
-                continue
+            summaries = data.setdefault("daily_summaries", [])
 
             old = [p for p in raw if p[0] < cutoff_raw]
-            if not old:
-                # Still prune ancient summaries
-                summaries = data.get("daily_summaries", [])
-                pruned = [s for s in summaries if s["date"] >= cutoff_max_str]
-                if len(pruned) != len(summaries):
-                    data["daily_summaries"] = pruned
-                    dirty = True
-                continue
+            if old:
+                data["raw_points"] = raw = [p for p in raw if p[0] >= cutoff_raw]
+                _merge_into_summaries(summaries, old)
+                dirty = True
 
-            data["raw_points"] = [p for p in raw if p[0] >= cutoff_raw]
+            pruned = [s for s in summaries if s["date"] >= cutoff_max_str]
+            if len(pruned) != len(summaries):
+                summaries[:] = pruned
+                dirty = True
 
-            by_date: dict[str, list[float]] = defaultdict(list)
-            for ts, val in old:
-                if val is not None:
-                    date_str = datetime.fromtimestamp(
-                        ts, tz=timezone.utc
-                    ).strftime("%Y-%m-%d")
-                    by_date[date_str].append(val)
-
-            summaries = data.setdefault("daily_summaries", [])
-            existing_idx = {s["date"]: i for i, s in enumerate(summaries)}
-
-            for date_str, values in by_date.items():
-                if date_str in existing_idx:
-                    s = summaries[existing_idx[date_str]]
-                    total = s["count"] + len(values)
-                    s["mean"] = (
-                        s["mean"] * s["count"] + sum(values)
-                    ) / total
-                    s["min"] = min(s["min"], min(values))
-                    s["max"] = max(s["max"], max(values))
-                    s["count"] = total
-                else:
-                    summaries.append(
-                        {
-                            "date": date_str,
-                            "min": min(values),
-                            "mean": sum(values) / len(values),
-                            "max": max(values),
-                            "count": len(values),
-                        }
-                    )
-
-            summaries[:] = [
-                s for s in summaries if s["date"] >= cutoff_max_str
-            ]
-            dirty = True
+            if (
+                not raw
+                and not summaries
+                and data.get("last_seen", now) < cutoff_max
+            ):
+                del self._data[entity_id]
+                dirty = True
 
         if dirty:
             self._schedule_save()
+
+
+def _date_ts(date_str: str) -> float:
+    return (
+        datetime.strptime(date_str, "%Y-%m-%d")
+        .replace(tzinfo=timezone.utc)
+        .timestamp()
+    )
+
+
+def _merge_into_summaries(
+    summaries: list[dict[str, Any]], points: list[list[float]]
+) -> None:
+    by_date: dict[str, list[float]] = defaultdict(list)
+    for ts, val in points:
+        if val is not None:
+            date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                "%Y-%m-%d"
+            )
+            by_date[date_str].append(val)
+
+    existing_idx = {s["date"]: i for i, s in enumerate(summaries)}
+    for date_str, values in by_date.items():
+        if date_str in existing_idx:
+            s = summaries[existing_idx[date_str]]
+            total = s["count"] + len(values)
+            s["mean"] = round(
+                (s["mean"] * s["count"] + sum(values)) / total, VALUE_DECIMALS
+            )
+            s["min"] = min(s["min"], min(values))
+            s["max"] = max(s["max"], max(values))
+            s["count"] = total
+        else:
+            summaries.append(
+                {
+                    "date": date_str,
+                    "min": min(values),
+                    "mean": round(sum(values) / len(values), VALUE_DECIMALS),
+                    "max": max(values),
+                    "count": len(values),
+                }
+            )
+    summaries.sort(key=lambda s: s["date"])
 
 
 # --- Recorder seeding ---
@@ -350,44 +466,57 @@ class BatteryHistoryStore:
 async def async_seed_from_recorder(
     hass: HomeAssistant,
     store: BatteryHistoryStore,
-    entity_id: str,
-    *,
-    is_binary: bool = False,
-) -> int:
-    """Import historical data from the HA recorder. Returns points added."""
+    entity_ids: list[str],
+    binary_ids: set[str],
+) -> None:
+    """Import up to HISTORY_MAX_DAYS of recorder history for new batteries.
+
+    One Long-Term-Statistics query (hourly means) for all numeric entities,
+    then one state-history query for everything without statistics.
+    """
     from homeassistant.components.recorder import get_instance
 
     instance = get_instance(hass)
     start_time = dt_util.utcnow() - timedelta(days=HISTORY_MAX_DAYS)
-    points: list[tuple[float, float | None]] = []
 
-    points = await _try_long_term_statistics(
-        hass, instance, entity_id, start_time
+    numeric = {e for e in entity_ids if e not in binary_ids}
+    history = (
+        await _long_term_statistics(hass, instance, numeric, start_time)
+        if numeric
+        else {}
+    )
+    missing = [e for e in entity_ids if not history.get(e)]
+    if missing:
+        history.update(
+            await _state_history(hass, instance, missing, start_time, binary_ids)
+        )
+
+    imported = 0
+    for entity_id in entity_ids:
+        points = history.get(entity_id)
+        if points:
+            points.sort(key=lambda p: p[0])
+            store.add_points_bulk(entity_id, points)
+            imported += 1
+            LOGGER.debug(
+                "Seeded %d historical data points for %s", len(points), entity_id
+            )
+        store.mark_seeded(entity_id)
+    # One line: hundreds of batteries triggered HA's "logging too frequently".
+    LOGGER.info(
+        "Imported recorder history for %d of %d new batteries",
+        imported,
+        len(entity_ids),
     )
 
-    if not points:
-        points = await _try_state_history(
-            hass, instance, entity_id, start_time, is_binary=is_binary
-        )
 
-    if points:
-        points.sort(key=lambda p: p[0])
-        store.add_points_bulk(entity_id, points)
-        LOGGER.info(
-            "Seeded %d historical data points for %s", len(points), entity_id
-        )
-
-    store.mark_seeded(entity_id)
-    return len(points)
-
-
-async def _try_long_term_statistics(
+async def _long_term_statistics(
     hass: HomeAssistant,
     instance: Any,
-    entity_id: str,
+    entity_ids: set[str],
     start_time: datetime,
-) -> list[tuple[float, float | None]]:
-    """Try to pull data from Long-Term Statistics."""
+) -> dict[str, list[tuple[float, float]]]:
+    """Hourly means from Long-Term Statistics, per entity."""
     try:
         from homeassistant.components.recorder.statistics import (
             statistics_during_period,
@@ -399,46 +528,41 @@ async def _try_long_term_statistics(
                 hass,
                 start_time,
                 None,
-                {entity_id},
+                entity_ids,
                 "hour",
                 None,
                 {"mean"},
             )
         )
+    except Exception:  # noqa: BLE001 - recorder errors must not break setup
+        LOGGER.debug("Could not read long-term statistics", exc_info=True)
+        return {}
 
-        if entity_id not in stats or not stats[entity_id]:
-            return []
-
-        points: list[tuple[float, float | None]] = []
-        for row in stats[entity_id]:
+    result: dict[str, list[tuple[float, float]]] = {}
+    for entity_id, rows in stats.items():
+        points: list[tuple[float, float]] = []
+        for row in rows:
             ts = row.get("start")
-            if ts is None:
-                continue
             if isinstance(ts, datetime):
                 ts = ts.timestamp()
             elif not isinstance(ts, (int, float)):
                 continue
             mean_val = row.get("mean")
             if mean_val is not None:
-                points.append((float(ts), float(mean_val)))
-        return points
-
-    except Exception:
-        LOGGER.debug(
-            "Could not read LTS for %s, will try state history", entity_id
-        )
-        return []
+                points.append((float(ts), round(float(mean_val), VALUE_DECIMALS)))
+        if points:
+            result[entity_id] = points
+    return result
 
 
-async def _try_state_history(
+async def _state_history(
     hass: HomeAssistant,
     instance: Any,
-    entity_id: str,
+    entity_ids: list[str],
     start_time: datetime,
-    *,
-    is_binary: bool = False,
-) -> list[tuple[float, float | None]]:
-    """Fall back to reading raw state history."""
+    binary_ids: set[str],
+) -> dict[str, list[tuple[float, float]]]:
+    """Fallback: values from the raw state history, per entity."""
     try:
         from homeassistant.components.recorder.history import (
             get_significant_states,
@@ -449,27 +573,26 @@ async def _try_state_history(
             hass,
             start_time,
             None,
-            [entity_id],
+            entity_ids,
         )
+    except Exception:  # noqa: BLE001 - recorder errors must not break setup
+        LOGGER.debug("Could not read state history", exc_info=True)
+        return {}
 
-        if entity_id not in states_dict:
-            return []
-
-        points: list[tuple[float, float | None]] = []
-        for state_obj in states_dict[entity_id]:
+    result: dict[str, list[tuple[float, float]]] = {}
+    for entity_id, states in states_dict.items():
+        points: list[tuple[float, float]] = []
+        for state_obj in states:
             if state_obj.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
                 continue
-            ts = state_obj.last_updated.timestamp()
-            if is_binary:
+            if entity_id in binary_ids:
                 val = 1.0 if state_obj.state == STATE_ON else 0.0
             else:
                 try:
                     val = float(state_obj.state)
                 except (ValueError, TypeError):
                     continue
-            points.append((ts, val))
-        return points
-
-    except Exception:
-        LOGGER.debug("Could not read state history for %s", entity_id)
-        return []
+            points.append((state_obj.last_updated.timestamp(), val))
+        if points:
+            result[entity_id] = points
+    return result

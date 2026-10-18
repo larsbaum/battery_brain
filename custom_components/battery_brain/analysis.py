@@ -1,11 +1,19 @@
-"""Battery classification into archetypes and per-category status derivation."""
+"""Battery classification, per-category status and remaining-lifetime logic.
+
+Pure functions without Home Assistant state; the only HA import is
+``homeassistant.util.dt`` for the current time (stubbed in the tests).
+History is passed in as ``[timestamp, value]`` points, oldest first.
+"""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from homeassistant.util import dt as dt_util
 
 from .const import (
     BINARY_CRITICAL_DAYS,
+    CHARGED_DEVICE_MIN_CHARGES,
     CATEGORY_BINARY,
     CATEGORY_LINEAR,
     CATEGORY_LOW_STABLE,
@@ -14,28 +22,73 @@ from .const import (
     CATEGORY_UNKNOWN_DEFAULT,
     CATEGORY_VOLTAGE,
     DEFAULT_THRESHOLDS,
+    ESTIMATE_CHARGING_GRACE_HOURS,
+    ESTIMATE_HALF_LIFE_FRACTION,
+    ESTIMATE_HALF_LIFE_MIN_DAYS,
     ESTIMATE_LINEAR_MIN_DAYS,
     ESTIMATE_MIN_POINTS,
     ESTIMATE_MIN_SPAN_HOURS,
+    ESTIMATE_RECHARGE_FULL_WEIGHT_DROP,
+    ESTIMATE_RECHARGE_HISTORY_PHASES,
+    ESTIMATE_RECHARGE_MIN_PHASE_DROP,
+    ESTIMATE_RECHARGE_MIN_PHASE_HOURS,
+    ESTIMATE_RECENT_MIN_DAYS,
+    ESTIMATE_RECENT_MIN_DECLINE,
+    ESTIMATE_RECENT_MIN_DECLINE_RATIO,
+    ESTIMATE_RECENT_MIN_R2,
     ESTIMATE_RECHARGE_RISE_TOL,
     ESTIMATE_REPLACEMENT_JUMP,
+    ESTIMATE_UNKNOWN_MIN_DROP,
+    ESTIMATE_UNKNOWN_MIN_R2,
+    ESTIMATE_VOLTAGE_RISE_MIN_RATIO,
     ESTIMATE_VOLTAGE_RISE_RATIO,
     ESTIMATE_WINDOW_DAYS,
+    LOW_STABLE_MAX_DECLINE,
+    LOW_STABLE_MIN_R2,
+    LOW_STABLE_TREND_DAYS,
     NOISE_SMOOTHING_MIN_POINTS,
     NOISE_SMOOTHING_PERCENTILE,
     NOISE_SMOOTHING_WINDOW_HOURS,
+    PLATEAU_KNEE_RATIO,
+    PLATEAU_CLIFF_CRITICAL_DAYS,
+    PLATEAU_CLIFF_WARNING_DAYS,
+    PLATEAU_KNEE_START_RATIO,
     PREDICTION_CRITICAL_DAYS,
     PREDICTION_WARNING_DAYS,
+    RECHARGE_DEFAULT_CYCLE_DAYS,
+    RECHARGE_EVENT_MIN_RISE,
+    RECHARGE_FAST_MAX_HOURS,
+    RECHARGE_FAST_MIN_EVENTS,
     RECHARGE_MIN_PEAK_RATIO,
+    UNCONFIRMED_DROP_HOURS,
+    UNCONFIRMED_DROP_PP,
+    UNCONFIRMED_DROP_RATIO,
+    VOLTAGE_RECHARGED_MIN_PHASES,
+    REPLACEMENT_HOLD_HOURS,
+    REPLACEMENT_IMMEDIATE_LEVEL,
+    REPLACEMENT_MIN_LEVEL,
+    REPLACEMENT_MERGE_DAYS,
     STALE_MIN_HOURS,
     STALE_MULTIPLIER,
     STALE_UNAVAILABLE_HOURS,
     STATUS_CRITICAL,
     STATUS_NORMAL,
     STATUS_WARNING,
+    VOLTAGE_EMPTY_FALLBACK_RATIO,
+    VOLTAGE_EMPTY_TABLE,
+    VOLTAGE_FALLBACK_LIFETIME_DAYS,
     VOLTAGE_MIN_RANGE_ABS,
     VOLTAGE_MIN_RANGE_RATIO,
 )
+
+_DAY = 86400.0
+_HOUR = 3600.0
+# Smaller declines are float noise of a flat fit, not a trend (pp per day).
+MIN_DECLINE_PER_DAY = 1e-6
+
+Point = tuple[float, float]
+# (time-weighted centre, mean value, covered fraction of the bucket)
+Bucket = tuple[float, float, float]
 
 # =====================================================================
 #  Classification — assign one of the seven archetypes
@@ -47,10 +100,14 @@ def classify_battery(
     *,
     is_binary: bool = False,
     unit: str | None = None,
+    points: list[list[float]] | None = None,
+    now_ts: float | None = None,
 ) -> str:
     """Return the archetype category for a battery based on its history.
 
-    Classification order matters: earlier checks take precedence.
+    Classification order matters: earlier checks take precedence. With
+    *points* (the same history as [ts, value]), a low battery that is
+    still draining is not mistaken for low_stable.
     """
     if is_binary:
         return CATEGORY_BINARY
@@ -61,16 +118,25 @@ def classify_battery(
     if _is_voltage(values, unit):
         return CATEGORY_VOLTAGE
 
-    if _is_rechargeable(values):
+    if _is_rechargeable(values, points):
         return CATEGORY_RECHARGEABLE
 
-    if _is_low_stable(values):
+    # Only the current battery: after a replacement, months of low readings
+    # of the old one would otherwise keep the new battery low_stable.
+    current = _current_battery(values, points, now_ts)
+    if (
+        _is_low_stable(current)
+        and _observed_long_enough(points, now_ts)
+        and not _still_draining(points, now_ts)
+    ):
         return CATEGORY_LOW_STABLE
 
     if _is_plateau_cliff(values):
         return CATEGORY_PLATEAU_CLIFF
 
-    if _is_linear(values):
+    # Regular recharges (a wall tablet held between 40 and 60 %) can look
+    # mostly descending; a primary battery isn't refilled every few hours.
+    if _is_linear(values) and _count_charge_rises(points) < RECHARGE_FAST_MIN_EVENTS:
         return CATEGORY_LINEAR
 
     return CATEGORY_UNKNOWN_DEFAULT
@@ -79,14 +145,22 @@ def classify_battery(
 # --- Detectors ---
 
 
+def is_voltage_unit(unit: str | None) -> bool:
+    return bool(unit) and unit.lower() in ("v", "mv", "volt", "millivolt")
+
+
 def _is_voltage(values: list[float], unit: str | None) -> bool:
-    if unit and unit.lower() in ("v", "mv", "volt", "millivolt"):
-        return True
+    # A known unit decides: a percentage battery stuck at 1–5 % for its
+    # whole history must not be mistaken for a voltage reading.
+    if unit:
+        return is_voltage_unit(unit)
     max_val = max(values)
     return 0.3 < max_val <= 5.0
 
 
-def _is_rechargeable(values: list[float]) -> bool:
+def _is_rechargeable(
+    values: list[float], points: list[list[float]] | None = None
+) -> bool:
     """Two or more gradual charge events detected via local-peak tracking.
 
     Key distinctions:
@@ -104,7 +178,9 @@ def _is_rechargeable(values: list[float]) -> bool:
     - Erratic sensors (median ≤5, >40% values near zero) are filtered out upfront.
 
     This algorithm works for both per-tick raw data (step size ≈0.15 pp/tick) and
-    coarser aggregated data (step size ≈1–20 pp/day).
+    coarser aggregated data (step size ≈1–20 pp/day). Fast charges in hourly
+    history (steps > 20 pp) are counted from the timestamped *points*, see
+    _count_fast_charges().
     """
     if len(values) < 10:
         return False
@@ -185,7 +261,66 @@ def _is_rechargeable(values: list[float]) -> bool:
                 step_count = 0
 
     resolve_pending()
-    return charge_events >= 2
+    if charge_events >= 2:
+        return True
+    if not points or len(points) != len(values):
+        return False
+    fast, multi_step = _count_fast_charges(points, peak_floor)
+    return (
+        charge_events + multi_step >= 2
+        or charge_events + fast >= RECHARGE_FAST_MIN_EVENTS
+    )
+
+
+def _count_fast_charges(
+    points: list[list[float]], peak_floor: float
+) -> tuple[int, int]:
+    """Charges too fast for the gradual rule: hourly steps above 20 pp.
+
+    A phone charging at 40–60 pp/h shows up in hourly means as e.g.
+    25 → 60 → 95. Counted: after a drop of at least 15 pp below the local
+    peak, a run of at least two rising steps with a step above the gradual
+    limit or fewer steps than a gradual charge needs, a total rise of
+    30 pp, reaching *peak_floor* within RECHARGE_FAST_MAX_HOURS. A single
+    jump stays a replacement, and daily means (24 h per step) never qualify.
+    Returns (charges, of which with at least 4 rising steps): a replacement
+    takes at most two hourly steps, so those are certainly charges.
+    """
+    min_discharge, min_rise, max_gradual_step = 15.0, 30.0, 20.0
+    pts = _clean(points)
+    count = multi_step = 0
+    peak = pts[0][1] if pts else 0.0
+    i = 1
+    while i < len(pts):
+        value = pts[i][1]
+        if value > peak:
+            peak = value
+            i += 1
+            continue
+        if peak - value < min_discharge:
+            i += 1
+            continue
+        # In a discharge: find the trough, then the rise after it.
+        while i + 1 < len(pts) and pts[i + 1][1] <= pts[i][1]:
+            i += 1
+        start = i
+        j = i
+        while j + 1 < len(pts) and pts[j + 1][1] - pts[j][1] > 0.5:
+            j += 1
+        steps = [pts[k + 1][1] - pts[k][1] for k in range(start, j)]
+        if (
+            len(steps) >= 2
+            and (max(steps) > max_gradual_step or len(steps) < 5)
+            and pts[j][1] - pts[start][1] >= min_rise
+            and pts[j][1] >= peak_floor
+            and pts[j][0] - pts[start][0] <= RECHARGE_FAST_MAX_HOURS * _HOUR
+        ):
+            count += 1
+            if len(steps) >= 4:
+                multi_step += 1
+        peak = pts[j][1]
+        i = j + 1
+    return count, multi_step
 
 
 def _is_low_stable(values: list[float]) -> bool:
@@ -209,6 +344,82 @@ def _is_low_stable(values: list[float]) -> bool:
         return True
 
     return False
+
+
+def _count_charge_rises(points: list[list[float]] | None) -> int:
+    """Rises of at least 10 pp within RECHARGE_FAST_MAX_HOURS (any level).
+
+    Battery replacements are rare; several such rises mean the device is
+    being charged. Without timestamps nothing is counted.
+    """
+    if not points:
+        return 0
+    pts = _clean(points)
+    count = 0
+    i = 1
+    while i < len(pts):
+        if pts[i][1] - pts[i - 1][1] <= 0.5:
+            i += 1
+            continue
+        start = i - 1
+        j = i
+        while j + 1 < len(pts) and pts[j + 1][1] - pts[j][1] > 0.5:
+            j += 1
+        if (
+            pts[j][1] - pts[start][1] >= 10.0
+            and pts[j][0] - pts[start][0] <= RECHARGE_FAST_MAX_HOURS * _HOUR
+        ):
+            count += 1
+        i = j + 1
+    return count
+
+
+def _still_draining(
+    points: list[list[float]] | None,
+    now_ts: float | None,
+) -> bool:
+    """A low battery that keeps declining steadily is not low_stable.
+
+    The low_stable tail check looks at the last 60 *readings*. A slowly
+    draining sensor that flickers between two values (26, 27, 26, …)
+    produces many readings within days and looks "low and stable" there.
+    It only counts as stuck if it also stopped declining over the last
+    LOW_STABLE_TREND_DAYS — a battery sitting at 1 % for weeks has, a
+    draining one at 26 % hasn't. A clear trend is required (r²), so noise
+    of a battery stuck low doesn't count as draining.
+    """
+    if not points:
+        return False
+    pts = _clean(points)
+    now = now_ts if now_ts is not None else pts[-1][0]
+    start = now - LOW_STABLE_TREND_DAYS * _DAY
+    before = [p for p in pts if p[0] < start]
+    window = before[-1:] + [p for p in pts if p[0] >= start]
+    trend = _fit_trend(_resample(window, now, _DAY, start_ts=start), now)
+    if trend is None:
+        return False
+    return (
+        -trend.slope * LOW_STABLE_TREND_DAYS * _DAY >= LOW_STABLE_MAX_DECLINE
+        and trend.r2 >= LOW_STABLE_MIN_R2
+    )
+
+
+def _observed_long_enough(
+    points: list[list[float]] | None, now_ts: float | None
+) -> bool:
+    """The current battery was observed for LOW_STABLE_TREND_DAYS.
+
+    With only a few days of readings (a sensor without long-term
+    statistics, or a battery replaced recently) a battery stuck at a low
+    level can't be told from one that drains slowly. Without timestamps
+    there is nothing to check.
+    """
+    if not points:
+        return True
+    pts = _clean(points)
+    now = now_ts if now_ts is not None else pts[-1][0]
+    start = _current_battery_start(pts, now)
+    return now - start >= LOW_STABLE_TREND_DAYS * _DAY
 
 
 def _stable_low(values: list[float]) -> bool:
@@ -299,6 +510,37 @@ def _descent_ratio(values: list[float], skip: int = 1) -> float:
     return decreases / total if total > 0 else 0.0
 
 
+def _current_battery(
+    values: list[float],
+    points: list[list[float]] | None,
+    now_ts: float | None,
+) -> list[float]:
+    """Values since the last replacement (same rule as detect_replacements).
+
+    A replacement counts once it has held for REPLACEMENT_HOLD_HOURS, or
+    right away if it reached REPLACEMENT_IMMEDIATE_LEVEL, so a solar spike
+    (real outdoor sensor: up to 65 % for hours) never counts. Without
+    timestamps, the whole history.
+    """
+    if not points or len(points) != len(values):
+        return values
+    now = now_ts if now_ts is not None else points[-1][0]
+    start = _current_battery_start(points, now)
+    return [v for ts, v in points if ts >= start]
+
+
+def _current_battery_start(points: list[list[float]], now: float) -> float:
+    """Timestamp of the last confirmed replacement, else the first point."""
+    level = {ts: v for ts, v in points}
+    confirmed = [
+        ts
+        for ts in detect_replacements(points)
+        if now - ts >= REPLACEMENT_HOLD_HOURS * _HOUR
+        or level.get(ts, 0.0) >= REPLACEMENT_IMMEDIATE_LEVEL
+    ]
+    return confirmed[-1] if confirmed else points[0][0]
+
+
 def _split_at_replacements(
     values: list[float], threshold: float = 20.0
 ) -> list[list[float]]:
@@ -327,31 +569,91 @@ def derive_status(
     binary_low_is_critical: bool = False,
     now_ts: float | None = None,
     all_points: list[list[float]] | None = None,
+    unit: str | None = None,
+    alert_threshold: float | None = None,
+    text_low: bool = False,
 ) -> str:
     """Return normal / warning / critical for *current_value*.
 
-    *all_points* is the full [ts, value] history (daily means + raw points);
-    without it, linear predictions fall back to the recent raw points only.
+    *values* are all known values (daily means + raw points), *raw_points*
+    the recent full-resolution points and *all_points* the full [ts, value]
+    history; without it, linear predictions use the raw points only.
+
+    With *alert_threshold* (threshold alert mode) a fixed percentage
+    decides instead of the archetype rules; binary and voltage batteries
+    keep their own rules. *text_low* marks a text reading that is the
+    device's own low signal ("low", "critical", "empty").
     """
-    if category == CATEGORY_BINARY:
+    if category == CATEGORY_BINARY or is_binary:
         return _status_binary(
             current_value, raw_points, binary_low_is_critical, now_ts=now_ts
         )
+    if alert_threshold is not None and category != CATEGORY_VOLTAGE:
+        return _status_threshold(
+            category,
+            current_value,
+            raw_points,
+            alert_threshold,
+            text_low=text_low,
+            binary_low_is_critical=binary_low_is_critical,
+            now_ts=now_ts,
+        )
     if category == CATEGORY_LINEAR:
         return _status_linear(
-            current_value, raw_points, all_points, now_ts=now_ts
+            current_value, all_points or raw_points, now_ts=now_ts
         )
     if category == CATEGORY_PLATEAU_CLIFF:
-        return _status_plateau_cliff(current_value, values)
+        return _status_plateau_cliff(
+            current_value, values, all_points or raw_points, now_ts=now_ts
+        )
     if category == CATEGORY_LOW_STABLE:
         return _status_low_stable(current_value, values, raw_points, now_ts=now_ts)
     if category == CATEGORY_VOLTAGE:
-        return _status_voltage(current_value, values)
+        return _status_voltage(
+            current_value, values, raw_points, now_ts=now_ts, unit=unit
+        )
     if category == CATEGORY_RECHARGEABLE:
         return _status_rechargeable(current_value, raw_points, now_ts=now_ts)
-    return _status_unknown_default(
-        current_value, is_binary, binary_low_is_critical, raw_points, now_ts=now_ts
-    )
+    return _status_unknown_default(current_value, raw_points, now_ts=now_ts)
+
+
+# --- threshold alert mode ---
+
+
+def _status_threshold(
+    category: str,
+    value: float | str | None,
+    raw_points: list[list[float]],
+    threshold: float,
+    *,
+    text_low: bool,
+    binary_low_is_critical: bool,
+    now_ts: float | None = None,
+) -> str:
+    """WARNING at or below *threshold*, CRITICAL at or below half of it.
+
+    No predictions. Short dips are smoothed out like for low_stable, except
+    for rechargeables, whose level moves too fast for that; a rechargeable
+    that was recharged within its usual cycle is only WARNING.
+    """
+    status = STATUS_NORMAL
+    if _is_number(value):
+        if category == CATEGORY_RECHARGEABLE:
+            level = value
+        else:
+            level = _representative_recent_value(value, raw_points, now_ts=now_ts)
+        if level <= threshold / 2:
+            status = STATUS_CRITICAL
+            if category == CATEGORY_RECHARGEABLE and _recently_recharged(
+                raw_points, _now(now_ts)
+            ):
+                status = STATUS_WARNING
+        elif level <= threshold:
+            status = STATUS_WARNING
+
+    if text_low and status != STATUS_CRITICAL:
+        status = STATUS_CRITICAL if binary_low_is_critical else STATUS_WARNING
+    return status
 
 
 # --- binary ---
@@ -367,9 +669,7 @@ def _status_binary(
     if value is None:
         return STATUS_NORMAL
 
-    is_low = str(value) == "on" or (
-        isinstance(value, (int, float)) and value >= 1.0
-    )
+    is_low = str(value) == "on" or (_is_number(value) and value >= 1.0)
     if not is_low:
         return STATUS_NORMAL
 
@@ -377,16 +677,16 @@ def _status_binary(
         return STATUS_CRITICAL
 
     if len(raw_points) >= 2:
-        now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
         low_since: float | None = None
         for point in reversed(raw_points):
             if point[1] >= 1.0:
                 low_since = point[0]
             else:
                 break
-        if low_since is not None and (
-            now - low_since
-        ) > BINARY_CRITICAL_DAYS * 86400:
+        if (
+            low_since is not None
+            and _now(now_ts) - low_since > BINARY_CRITICAL_DAYS * _DAY
+        ):
             return STATUS_CRITICAL
 
     return STATUS_WARNING
@@ -397,12 +697,11 @@ def _status_binary(
 
 def _status_linear(
     value: float | str | None,
-    raw_points: list[list[float]],
-    all_points: list[list[float]] | None = None,
+    points: list[list[float]],
     *,
     now_ts: float | None = None,
 ) -> str:
-    if not isinstance(value, (int, float)):
+    if not _is_number(value):
         return STATUS_NORMAL
 
     warning_pct, critical_pct = DEFAULT_THRESHOLDS[CATEGORY_LINEAR]
@@ -412,7 +711,7 @@ def _status_linear(
     elif value <= warning_pct:
         status = STATUS_WARNING
 
-    remaining = _estimate_linear(raw_points, all_points, now_ts=now_ts)
+    remaining = _estimate_trend(points, _now(now_ts))
     if remaining is not None:
         if remaining < PREDICTION_CRITICAL_DAYS:
             status = STATUS_CRITICAL
@@ -428,27 +727,42 @@ def _status_linear(
 def _status_plateau_cliff(
     value: float | str | None,
     values: list[float],
+    points: list[list[float]],
+    *,
+    now_ts: float | None = None,
 ) -> str:
-    if not isinstance(value, (int, float)) or len(values) < 5:
+    """Absolute thresholds, below the knee the measured time until empty.
+
+    Leaving the plateau alone is no reason to warn: a coin cell at 85 %
+    that loses a percent every few days still lasts for months. Without
+    timestamped history the position below the plateau decides instead.
+    """
+    if not _is_number(value):
         return STATUS_NORMAL
 
-    sorted_desc = sorted(values, reverse=True)
-    top_n = max(1, len(sorted_desc) // 4)
-    plateau = sum(sorted_desc[:top_n]) / top_n
+    warning_pct, critical_pct = DEFAULT_THRESHOLDS[CATEGORY_PLATEAU_CLIFF]
+    status = STATUS_NORMAL
+    if value <= critical_pct:
+        return STATUS_CRITICAL
+    if value <= warning_pct:
+        status = STATUS_WARNING
 
-    if plateau < 10:
-        return STATUS_NORMAL
+    if len(values) < 5:
+        return status
+    plateau = _plateau_level(values)
+    if plateau < 10 or value >= plateau * PLATEAU_KNEE_RATIO:
+        return status
 
-    recent = values[-min(10, len(values)) :]
-    if len(recent) >= 2:
-        recent_drop = max(recent) - min(recent)
-        if recent_drop > plateau * 0.30:
-            return STATUS_CRITICAL
+    if points:
+        remaining = _estimate_plateau_cliff(points, value, _now(now_ts))
+        if remaining is not None:
+            if remaining < PLATEAU_CLIFF_CRITICAL_DAYS:
+                return STATUS_CRITICAL
+            if remaining < PLATEAU_CLIFF_WARNING_DAYS:
+                return STATUS_WARNING
+        return status
 
-    ratio = value / plateau if plateau > 0 else 1.0
-    if ratio >= 0.90:
-        return STATUS_NORMAL
-    if ratio >= 0.70:
+    if value >= plateau * 0.70:
         return STATUS_WARNING
     return STATUS_CRITICAL
 
@@ -463,7 +777,7 @@ def _status_low_stable(
     *,
     now_ts: float | None = None,
 ) -> str:
-    if not isinstance(value, (int, float)) or len(values) < 5:
+    if not _is_number(value) or len(values) < 5:
         return STATUS_NORMAL
 
     representative = _representative_recent_value(
@@ -488,24 +802,33 @@ def _status_low_stable(
 def _status_voltage(
     value: float | str | None,
     values: list[float],
+    raw_points: list[list[float]],
+    *,
+    now_ts: float | None = None,
+    unit: str | None = None,
 ) -> str:
-    if not isinstance(value, (int, float)) or len(values) < 3:
+    """Charge level between the battery's full and empty voltage.
+
+    Relative to the observed min/max instead, a battery that was never
+    replaced sits at its own minimum all the time and would be pegged at
+    critical (or flap with daily temperature swings).
+    """
+    if not _is_number(value) or len(values) < 3:
         return STATUS_NORMAL
 
-    vmin = min(values)
-    vmax = max(values)
-    v_range = vmax - vmin
-
-    # A range this small (relative to the voltage scale) is sensor noise or
-    # quantization, not a real discharge curve — e.g. a coin-cell sensor that
-    # only ever reports two values 12 mV apart. Treating it as a real signal
-    # would peg the status at whichever extreme the current value happens to
-    # sit at, often permanently.
-    min_range = max(VOLTAGE_MIN_RANGE_ABS, VOLTAGE_MIN_RANGE_RATIO * vmax)
-    if v_range < min_range:
+    tol = _voltage_rise_tol(values)
+    cleaned = [v for _, v in _despike(list(enumerate(values)), tol)]
+    _, full, empty = _voltage_reference(cleaned, unit)
+    span = full - empty
+    # Full barely above empty: the empty reference doesn't fit this device
+    # (or the readings are pure noise) — no meaningful charge level.
+    if span < _voltage_min_range(full, unit):
         return STATUS_NORMAL
 
-    pct = ((value - vmin) / v_range) * 100
+    representative = _representative_recent_value(
+        value, raw_points, now_ts=now_ts
+    )
+    pct = (representative - empty) / span * 100
     warning_pct, critical_pct = DEFAULT_THRESHOLDS[CATEGORY_VOLTAGE]
 
     if pct <= critical_pct:
@@ -524,16 +847,13 @@ def _status_rechargeable(
     *,
     now_ts: float | None = None,
 ) -> str:
-    if not isinstance(value, (int, float)):
+    if not _is_number(value):
         return STATUS_NORMAL
 
     warning_pct, critical_pct = DEFAULT_THRESHOLDS[CATEGORY_RECHARGEABLE]
 
     if value <= critical_pct:
-        cycle = _estimate_charge_cycle_days(raw_points)
-        if _recent_recharge_detected(
-            raw_points, lookback_days=cycle * 1.5, now_ts=now_ts
-        ):
+        if _recently_recharged(raw_points, _now(now_ts)):
             return STATUS_WARNING
         return STATUS_CRITICAL
 
@@ -542,23 +862,33 @@ def _status_rechargeable(
     return STATUS_NORMAL
 
 
+def _recently_recharged(raw_points: list[list[float]], now: float) -> bool:
+    """Whether the last recharge lies within 1.5 typical charge cycles."""
+    points = _clean(raw_points)
+    if len(points) < 2:
+        return False
+    phases = _discharge_phases([v for _, v in points], RECHARGE_EVENT_MIN_RISE)
+    charges = [points[start][0] for start, _ in phases[1:]]
+    if not charges:
+        return False
+    cycle_days = RECHARGE_DEFAULT_CYCLE_DAYS
+    if len(charges) >= 2:
+        cycle_days = _median(
+            [(b - a) / _DAY for a, b in zip(charges, charges[1:])]
+        )
+    return now - charges[-1] <= 1.5 * cycle_days * _DAY
+
+
 # --- unknown_default ---
 
 
 def _status_unknown_default(
     value: float | str | None,
-    is_binary: bool,
-    binary_low_is_critical: bool,
     raw_points: list[list[float]] | None = None,
     *,
     now_ts: float | None = None,
 ) -> str:
-    if is_binary:
-        if str(value) == "on":
-            return STATUS_CRITICAL if binary_low_is_critical else STATUS_WARNING
-        return STATUS_NORMAL
-
-    if not isinstance(value, (int, float)):
+    if not _is_number(value):
         return STATUS_NORMAL
 
     representative = _representative_recent_value(
@@ -571,11 +901,6 @@ def _status_unknown_default(
     if representative <= warning_pct:
         return STATUS_WARNING
     return STATUS_NORMAL
-
-
-# =====================================================================
-#  Shared helpers
-# =====================================================================
 
 
 def _representative_recent_value(
@@ -598,8 +923,7 @@ def _representative_recent_value(
     if len(raw_points) < NOISE_SMOOTHING_MIN_POINTS:
         return current_value
 
-    now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
-    cutoff = now - window_hours * 3600
+    cutoff = _now(now_ts) - window_hours * _HOUR
     window = [p[1] for p in raw_points if p[0] >= cutoff and p[1] is not None]
 
     if len(window) < NOISE_SMOOTHING_MIN_POINTS:
@@ -622,249 +946,627 @@ def estimate_remaining(
     all_points: list[list[float]],
     *,
     now_ts: float | None = None,
+    unit: str | None = None,
 ) -> float | None:
-    """Estimated days until the battery is empty, or None if not estimable.
+    """Days until empty measured from the battery's own trend, or None.
 
     *raw_points* are the recent full-resolution points, *all_points* the
-    complete chronological history (daily means + raw points) as [ts, value].
-    Only archetypes with a meaningful notion of "time until empty" get an
-    estimate: linear, rechargeable, voltage and plateau_cliff.
+    complete history (daily means + raw points). low_stable and binary
+    readings carry no trend; for them, and whenever this returns None,
+    lifetime.fallback_remaining() provides an estimate.
     """
-    if not isinstance(current_value, (int, float)):
+    if not _is_number(current_value):
         return None
+    now = _now(now_ts)
+    history = all_points or raw_points
     if category == CATEGORY_LINEAR:
-        return _estimate_linear(raw_points, all_points, now_ts=now_ts)
+        return _estimate_trend(history, now)
+    if category == CATEGORY_UNKNOWN_DEFAULT:
+        return _estimate_trend(history, now, gated=True)
     if category == CATEGORY_RECHARGEABLE:
-        return _estimate_rechargeable(raw_points, now_ts=now_ts)
+        return _estimate_rechargeable(raw_points, current_value, now)
     if category == CATEGORY_VOLTAGE:
-        return _estimate_voltage(all_points, now_ts=now_ts)
+        return _estimate_voltage(history, now, unit)
     if category == CATEGORY_PLATEAU_CLIFF:
-        return _estimate_plateau_cliff(all_points, now_ts=now_ts)
+        return _estimate_plateau_cliff(history, current_value, now)
     return None
 
 
-def _estimate_linear(
-    raw_points: list[list[float]],
-    all_points: list[list[float]] | None = None,
-    *,
-    now_ts: float | None = None,
+def _estimate_trend(
+    points: list[list[float]], now: float, *, gated: bool = False
 ) -> float | None:
-    """Trend over the whole life of the current battery, until 0%.
+    """Days until 0 % along the trend since the last battery replacement.
 
-    Slow linear drains change by only a few integer percent per month, so a
-    short window yields a noise-dominated slope. Instead, regress over daily
-    means since the last battery replacement (one point per day, so the
-    hourly raw points of the last 30 days don't outweigh older history).
-    Freshly replaced batteries without enough days fall back to the recent
-    raw points.
+    With *gated* (unknown_default), only a long, clearly declining trend
+    yields an estimate.
     """
-    if all_points:
-        daily = _daily_means(all_points)
-        segment = daily[_trailing_segment_start(daily, ESTIMATE_REPLACEMENT_JUMP):]
-        if len(segment) >= ESTIMATE_LINEAR_MIN_DAYS:
-            return estimate_remaining_days(
-                segment, now_ts=now_ts, window_days=None
-            )
-    return estimate_remaining_days(
-        raw_points, now_ts=now_ts, segment_rise=ESTIMATE_REPLACEMENT_JUMP
-    )
-
-
-def _daily_means(points: list[list[float]]) -> list[list[float]]:
-    """Collapse [ts, value] points into one [mean ts, mean value] per UTC day."""
-    buckets: dict[int, list[list[float]]] = {}
-    for p in points:
-        if p[1] is not None:
-            buckets.setdefault(int(p[0] // 86400), []).append(p)
-    return [
-        [
-            sum(p[0] for p in day) / len(day),
-            sum(p[1] for p in day) / len(day),
-        ]
-        for _, day in sorted(buckets.items())
-    ]
+    pts = _clean(points, ESTIMATE_REPLACEMENT_JUMP)
+    if len(pts) < 2:
+        return None
+    start, _ = _discharge_phases(
+        [v for _, v in pts], ESTIMATE_REPLACEMENT_JUMP
+    )[-1]
+    phase = pts[start:]
+    trend = _phase_trend(phase, now)
+    if trend is None:
+        return None
+    if gated:
+        span = now - phase[0][0]
+        if (
+            span < ESTIMATE_LINEAR_MIN_DAYS * _DAY
+            or trend.r2 < ESTIMATE_UNKNOWN_MIN_R2
+            or -trend.slope * span < ESTIMATE_UNKNOWN_MIN_DROP
+        ):
+            return None
+    return _days_until(trend, 0.0)
 
 
 def _estimate_rechargeable(
-    raw_points: list[list[float]], *, now_ts: float | None = None
+    raw_points: list[list[float]], current_value: float, now: float
 ) -> float | None:
-    # Regress over the current discharge phase only (since the last charge).
-    # While charging, the trailing phase is too short and this yields None.
-    return estimate_remaining_days(
-        raw_points, now_ts=now_ts, segment_rise=ESTIMATE_RECHARGE_RISE_TOL
-    )
+    """Days until 0 % at the drain rate of the current discharge phase.
+
+    The rate blends the current phase's own trend with the median rate of
+    past discharge phases: right after unplugging the typical rate is used,
+    and the more the current phase has dropped, the more its own rate
+    counts. None while charging.
+    """
+    pts = _clean(raw_points)
+    if len(pts) < 2:
+        return None
+    values = [v for _, v in pts]
+    phases = _discharge_phases(values, ESTIMATE_RECHARGE_RISE_TOL)
+    start, _ = phases[-1]
+    if (
+        _ends_in_rise(values, ESTIMATE_RECHARGE_RISE_TOL)
+        and now - pts[start][0] < ESTIMATE_CHARGING_GRACE_HOURS * _HOUR
+    ):
+        return None  # charging
+
+    typical = _typical_discharge_rate(pts, phases)
+
+    current = pts[start:]
+    own_phase = _after_top(current)
+    if len(own_phase) < 2:
+        own_phase = current  # a single drop so far: keep the top reading
+    trend = _phase_trend(own_phase, now)
+    own = -trend.slope if trend is not None and trend.slope < 0 else None
+
+    if own is None and typical is None:
+        return None
+    if typical is None:
+        rate = own
+    elif own is None:
+        rate = typical
+    else:
+        dropped = current[0][1] - current[-1][1]
+        weight = min(1.0, max(dropped, 0.0) / ESTIMATE_RECHARGE_FULL_WEIGHT_DROP)
+        rate = weight * own + (1 - weight) * typical
+    return max(current_value, 0.0) / rate / _DAY
+
+
+def typical_discharge_rate(
+    points: list[list[float]],
+    *,
+    min_phase_hours: float = ESTIMATE_RECHARGE_MIN_PHASE_HOURS,
+) -> float | None:
+    """Median drain rate (pp per day) of the past discharge phases, or None.
+
+    A single glitch reading (e.g. 0 % and straight back) is no charge.
+    """
+    pts = _clean(points, UNCONFIRMED_DROP_PP)
+    if len(pts) < 2:
+        return None
+    phases = _discharge_phases([v for _, v in pts], ESTIMATE_RECHARGE_RISE_TOL)
+    rate = _typical_discharge_rate(pts, phases, min_phase_hours=min_phase_hours)
+    return rate * _DAY if rate is not None else None
+
+
+def _typical_discharge_rate(
+    pts: list[Point],
+    phases: list[tuple[int, int]],
+    *,
+    min_phase_hours: float = ESTIMATE_RECHARGE_MIN_PHASE_HOURS,
+) -> float | None:
+    """Median drain rate (per second) of the completed discharge phases.
+
+    Each phase's rate is its total drop over its duration — from its first
+    reading below the top (time on the charger doesn't count) to its end:
+    halfway between the bottom reading and the first charging reading, as
+    charging started somewhere in between. An average, not a regression: a
+    tablet that idles for weeks and is then used heavily for a day drains
+    at the average of both.
+    """
+    rates: list[float] = []
+    for p_start, p_end in phases[:-1]:
+        phase = _after_top(pts[p_start : p_end + 1])
+        if (
+            len(phase) < 2
+            or phase[-1][0] - phase[0][0] < min_phase_hours * _HOUR
+            or phase[0][1] - phase[-1][1] < ESTIMATE_RECHARGE_MIN_PHASE_DROP
+        ):
+            continue
+        end = (phase[-1][0] + pts[p_end + 1][0]) / 2
+        rates.append((phase[0][1] - phase[-1][1]) / (end - phase[0][0]))
+    if not rates:
+        return None
+    return _median(rates[-ESTIMATE_RECHARGE_HISTORY_PHASES:])
+
+
+def is_charged_device(raw_points: list[list[float]]) -> bool:
+    """Whether the battery gets recharged regularly (≥ 2 clear rises).
+
+    True for devices kept within a charge window by an automation or
+    sitting in a dock, which aren't classified as rechargeable because
+    their cycles are small.
+    """
+    # A single glitch reading (97 → 0 → 97) is no charge.
+    values = [v for _, v in _clean(raw_points, UNCONFIRMED_DROP_PP)]
+    if len(values) < 3:
+        return False
+    rises = len(_discharge_phases(values, RECHARGE_EVENT_MIN_RISE)) - 1
+    return rises >= CHARGED_DEVICE_MIN_CHARGES
 
 
 def _estimate_voltage(
-    all_points: list[list[float]], *, now_ts: float | None = None
+    points: list[list[float]], now: float, unit: str | None
 ) -> float | None:
-    """Days until the voltage reaches the level the previous battery died at.
-
-    The "empty" voltage is the minimum observed *before* the current
-    discharge phase. Without a previous phase (first battery ever seen),
-    there is no known empty level, and the current value would trivially
-    be the minimum — so no estimate.
-    """
-    points = [p for p in all_points if p[1] is not None]
-    if len(points) < ESTIMATE_MIN_POINTS:
+    """Days until the voltage reaches the empty level (see _voltage_reference)."""
+    raw_values = [p[1] for p in points if p[1] is not None]
+    if len(raw_values) < 2:
         return None
-
-    vals = [p[1] for p in points]
-    vmax = max(vals)
-    v_range = vmax - min(vals)
-    if v_range < max(VOLTAGE_MIN_RANGE_ABS, VOLTAGE_MIN_RANGE_RATIO * vmax):
-        return None
-
-    rise_tol = ESTIMATE_VOLTAGE_RISE_RATIO * v_range
-    start = _trailing_segment_start(points, rise_tol)
-    if start == 0:
-        return None
-    floor = min(p[1] for p in points[:start])
-
-    return estimate_remaining_days(
-        points, now_ts=now_ts, floor=floor, segment_rise=rise_tol
+    pts = _clean(points, _voltage_rise_tol(raw_values))
+    values = [v for _, v in pts]
+    start, full, empty = _voltage_reference(values, unit)
+    phase_values = values[start:]
+    if max(phase_values) - min(phase_values) < _voltage_min_range(full, unit):
+        return None  # no measurable discharge yet
+    min_decline = ESTIMATE_RECENT_MIN_DECLINE_RATIO * (full - empty)
+    return _days_until(
+        _phase_trend(pts[start:], now, min_decline=min_decline), empty
     )
 
 
 def _estimate_plateau_cliff(
-    all_points: list[list[float]], *, now_ts: float | None = None
+    points: list[list[float]], current_value: float, now: float
 ) -> float | None:
-    """Expected lifetime from past replacement intervals minus current age.
+    """Trend since the battery left its plateau (the knee).
 
-    Plateau batteries give no usable trend before they fall off the cliff,
-    so the only signal is how long previous batteries in this device lasted.
-    Needs at least two observed replacements (= one complete lifetime).
+    On the plateau the readings carry no trend; past lifetimes of this
+    device (lifetime.py) are the only signal then.
     """
-    points = [p for p in all_points if p[1] is not None]
-    replacements = [
-        points[i][0]
-        for i in range(1, len(points))
-        if points[i][1] - points[i - 1][1] > ESTIMATE_REPLACEMENT_JUMP
-    ]
-    if len(replacements) < 2:
+    pts = _clean(points, ESTIMATE_REPLACEMENT_JUMP)
+    if not pts:
         return None
+    values = [v for _, v in pts]
+    plateau = _plateau_level(values)
+    if plateau < 10 or current_value >= plateau * PLATEAU_KNEE_RATIO:
+        return None
+    start, _ = _discharge_phases(values, ESTIMATE_REPLACEMENT_JUMP)[-1]
+    phase = pts[start:]
+    knee = max(
+        (
+            i
+            for i, (_, v) in enumerate(phase)
+            if v >= plateau * PLATEAU_KNEE_START_RATIO
+        ),
+        default=0,
+    )
+    return _days_until(_phase_trend(phase[knee:], now), 0.0)
 
-    lifetimes = [
-        (replacements[i] - replacements[i - 1]) / 86400
-        for i in range(1, len(replacements))
-    ]
-    now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
-    age = (now - replacements[-1]) / 86400
-    return max(_median(lifetimes) - age, 0.0)
 
+def detect_replacements(points: list[list[float]]) -> list[float]:
+    """Timestamps at which a new battery was inserted (percentage history).
 
-def _trailing_segment_start(
-    points: list[tuple[float, float]] | list[list[float]], rise_tol: float
-) -> int:
-    """Index where the trailing discharge phase starts.
-
-    Walks backwards from the end and stops at the last upward step larger
-    than *rise_tol* (a recharge or replacement).
+    A replacement is a rise of more than ESTIMATE_REPLACEMENT_JUMP to at
+    least REPLACEMENT_MIN_LEVEL that holds for REPLACEMENT_HOLD_HOURS. A
+    solar spike or a short charge burst falls back within hours; a sunny
+    week can lift a solar sensor for days, but not to a new battery's level.
     """
-    for i in range(len(points) - 1, 0, -1):
-        if points[i][1] - points[i - 1][1] > rise_tol:
-            return i
-    return 0
+    pts = _clean(points, ESTIMATE_REPLACEMENT_JUMP)
+    if not pts:
+        return []
+    events: list[float] = []
+    for start, _ in _discharge_phases(
+        [v for _, v in pts], ESTIMATE_REPLACEMENT_JUMP
+    )[1:]:
+        top_ts, top = pts[start]
+        if top < REPLACEMENT_MIN_LEVEL:
+            continue
+        hold_until = top_ts + REPLACEMENT_HOLD_HOURS * _HOUR
+        held = [v for ts, v in pts[start:] if ts <= hold_until]
+        if min(held) >= top - ESTIMATE_REPLACEMENT_JUMP:
+            events.append(top_ts)
+    return events
 
 
-def estimate_remaining_days(
-    raw_points: list[list[float]],
+def detect_binary_replacements(points: list[list[float]]) -> list[float]:
+    """Times a binary low-battery signal cleared for good (new battery).
+
+    Readings are 1.0 (low) and 0.0 (normal). Both the low signal before
+    and the normal state after must last REPLACEMENT_HOLD_HOURS, so a
+    flapping signal doesn't count.
+    """
+    pts = _clean(points)
+    hold = REPLACEMENT_HOLD_HOURS * _HOUR
+    events: list[float] = []
+    low_since: float | None = None
+    for i, (ts, value) in enumerate(pts):
+        if value >= 1.0:
+            if low_since is None:
+                low_since = ts
+            continue
+        if low_since is not None and ts - low_since >= hold:
+            if all(v < 1.0 for t, v in pts[i:] if t <= ts + hold):
+                events.append(ts)
+        low_since = None
+    return events
+
+
+def merge_replacement_events(*sources: list[float]) -> list[float]:
+    """Sorted union of replacement timestamps; near-duplicates collapsed."""
+    merged: list[float] = []
+    for ts in sorted(ts for source in sources for ts in source):
+        if merged and ts - merged[-1] < REPLACEMENT_MERGE_DAYS * _DAY:
+            continue
+        merged.append(ts)
+    return merged
+
+
+# =====================================================================
+#  Shared helpers
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class _Trend:
+    """A fitted line: slope per second and the fitted value at "now"."""
+
+    slope: float
+    level: float
+    r2: float
+
+
+def _phase_trend(
+    phase: list[Point],
+    now: float,
     *,
-    now_ts: float | None = None,
-    floor: float = 0.0,
-    segment_rise: float | None = None,
-    window_days: float | None = ESTIMATE_WINDOW_DAYS,
-) -> float | None:
-    """Linear-regression estimate of days until value reaches *floor*.
+    min_decline: float = ESTIMATE_RECENT_MIN_DECLINE,
+) -> _Trend | None:
+    """Trend of a discharge phase up to *now*.
 
-    Uses the last *window_days* of points (all points if None). With
-    *segment_rise*, only
-    the trailing discharge phase (after the last upward step larger than
-    *segment_rise*) is used, and it must span at least
-    ESTIMATE_MIN_SPAN_HOURS.
+    Phases shorter than ESTIMATE_LINEAR_MIN_DAYS are regressed over hourly
+    buckets of the last ESTIMATE_WINDOW_DAYS. Longer ones over daily
+    buckets: the shortest recent window with a clear decline of at least
+    *min_decline* (see ESTIMATE_RECENT_*) if there is one — it follows an
+    accelerating drain — otherwise the recency-weighted whole phase.
     """
-    if len(raw_points) < 3:
+    if len(phase) < 2:
         return None
-
-    now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
-    cutoff = now - window_days * 86400 if window_days is not None else 0.0
-    recent = [
-        (p[0], p[1])
-        for p in raw_points
-        if p[0] >= cutoff and p[1] is not None
-    ]
-    if segment_rise is not None:
-        recent = recent[_trailing_segment_start(recent, segment_rise):]
-        if (
-            len(recent) >= 2
-            and recent[-1][0] - recent[0][0] < ESTIMATE_MIN_SPAN_HOURS * 3600
-        ):
+    span = now - phase[0][0]
+    if span < ESTIMATE_MIN_SPAN_HOURS * _HOUR:
+        return None
+    if span < ESTIMATE_LINEAR_MIN_DAYS * _DAY:
+        series = _resample(
+            phase, now, _HOUR, start_ts=now - ESTIMATE_WINDOW_DAYS * _DAY
+        )
+        if len(series) < ESTIMATE_MIN_POINTS:
             return None
-    if len(recent) < ESTIMATE_MIN_POINTS:
+        return _fit_trend(series, now)
+
+    series = _resample(phase, now, _DAY)
+    recent: _Trend | None = None
+    window = span / 2
+    while window >= ESTIMATE_RECENT_MIN_DAYS * _DAY:
+        buckets = [b for b in series if b[0] >= now - window]
+        trend = (
+            _fit_trend(buckets, now)
+            if len(buckets) >= ESTIMATE_MIN_POINTS
+            else None
+        )
+        if (
+            trend is not None
+            and trend.r2 >= ESTIMATE_RECENT_MIN_R2
+            and -trend.slope * window >= min_decline
+        ):
+            recent = trend
+        window /= 2
+    if recent is not None:
+        return recent
+    half_life = max(
+        ESTIMATE_HALF_LIFE_MIN_DAYS * _DAY, span * ESTIMATE_HALF_LIFE_FRACTION
+    )
+    return _fit_trend(series, now, half_life_s=half_life)
+
+
+def _resample(
+    points: list[Point],
+    end_ts: float,
+    bucket_s: float,
+    *,
+    start_ts: float | None = None,
+) -> list[Bucket]:
+    """Time-weighted bucket means of the readings as a continuous curve.
+
+    Readings are interpolated linearly; the last one holds until *end_ts*.
+    Change-only readings and hourly imported history thus weigh the same,
+    a slow integer sensor's steps become the underlying slope, and time
+    since the last change counts as "no drain". Buckets end at *end_ts*,
+    so the most recent one is always complete (a partial day would skew
+    the trend with half a day/night temperature cycle). Returns one
+    (time-weighted centre, mean value, covered fraction) per bucket.
+    """
+    acc: dict[int, list[float]] = {}
+    for i, (ts, value) in enumerate(points):
+        if i + 1 < len(points):
+            next_ts, next_value = points[i + 1]
+            rate = (next_value - value) / (next_ts - ts) if next_ts > ts else 0.0
+        else:
+            next_ts, rate = end_ts, 0.0
+        seg_end = min(next_ts, end_ts)
+        t = ts if start_ts is None else max(ts, start_ts)
+        while t < seg_end:
+            bucket = int((t - end_ts) // bucket_s)
+            stop = min(end_ts + (bucket + 1) * bucket_s, seg_end)
+            if stop <= t:  # float rounding at a bucket edge
+                bucket += 1
+                stop = min(end_ts + (bucket + 1) * bucket_s, seg_end)
+            duration = stop - t
+            mean = value + rate * ((t + stop) / 2 - ts)
+            sums = acc.setdefault(bucket, [0.0, 0.0, 0.0])
+            sums[0] += mean * duration
+            sums[1] += (t + stop) / 2 * duration
+            sums[2] += duration
+            t = stop
+    return [
+        (s[1] / s[2], s[0] / s[2], s[2] / bucket_s)
+        for _, s in sorted(acc.items())
+    ]
+
+
+def _fit_trend(
+    series: list[Bucket], now: float, *, half_life_s: float | None = None
+) -> _Trend | None:
+    """Least-squares line through *series*, evaluated at *now*.
+
+    Buckets are weighted by how much of them is covered and, with
+    *half_life_s*, by how recent they are.
+    """
+    if len(series) < 2:
         return None
-
-    n = len(recent)
-    sx = sum(t for t, _ in recent)
-    sy = sum(v for _, v in recent)
-    sxy = sum(t * v for t, v in recent)
-    sxx = sum(t * t for t, _ in recent)
-
-    denom = n * sxx - sx * sx
-    if abs(denom) < 1e-10:
+    weights = [
+        covered * (0.5 ** ((now - t) / half_life_s) if half_life_s else 1.0)
+        for t, _, covered in series
+    ]
+    total = sum(weights)
+    mean_t = sum(w * t for w, (t, _, _) in zip(weights, series)) / total
+    mean_v = sum(w * v for w, (_, v, _) in zip(weights, series)) / total
+    s_tt = s_tv = s_vv = 0.0
+    for w, (t, v, _) in zip(weights, series):
+        dt = t - mean_t
+        dv = v - mean_v
+        s_tt += w * dt * dt
+        s_tv += w * dt * dv
+        s_vv += w * dv * dv
+    if s_tt <= 0:
         return None
+    slope = s_tv / s_tt
+    r2 = s_tv * s_tv / (s_tt * s_vv) if s_vv > 0 else 0.0
+    return _Trend(slope=slope, level=mean_v + slope * (now - mean_t), r2=r2)
 
-    slope = (n * sxy - sx * sy) / denom
-    if slope >= 0:
+
+def _days_until(trend: _Trend | None, floor: float) -> float | None:
+    """Days until the fitted line reaches *floor*; None if not declining."""
+    # Exactly flat readings can fit a slope of about -1e-30 (float noise),
+    # which became "measured: 100 years" instead of the fallback.
+    if trend is None or -trend.slope * _DAY < MIN_DECLINE_PER_DAY:
         return None
-
-    intercept = (sy - slope * sx) / n
-    headroom = slope * now + intercept - floor
-
+    headroom = trend.level - floor
     if headroom <= 0:
         return 0.0
-
-    return (-headroom / slope) / 86400
-
-
-def _estimate_charge_cycle_days(raw_points: list[list[float]]) -> float:
-    """Median interval between detected charge events (days)."""
-    if len(raw_points) < 4:
-        return 7.0
-
-    charge_times: list[float] = []
-    for i in range(1, len(raw_points)):
-        prev, cur = raw_points[i - 1][1], raw_points[i][1]
-        if prev is not None and cur is not None and cur - prev > 10:
-            charge_times.append(raw_points[i][0])
-
-    if len(charge_times) < 2:
-        return 7.0
-
-    intervals = [
-        (charge_times[i] - charge_times[i - 1]) / 86400
-        for i in range(1, len(charge_times))
-    ]
-    return _median(intervals)
+    return headroom / -trend.slope / _DAY
 
 
-def _recent_recharge_detected(
-    raw_points: list[list[float]],
-    *,
-    lookback_days: float = 7.0,
-    now_ts: float | None = None,
+def _discharge_phases(
+    values: list[float], rise_tol: float
+) -> list[tuple[int, int]]:
+    """Split a series into discharge phases at rises larger than *rise_tol*.
+
+    A rise is a run of consecutive non-decreasing readings, measured from
+    its first to its last reading — so a recharge reported in 1 pp steps
+    counts as one rise. Each phase is (start, end): it starts where a rise
+    first reached its top (battery inserted / charging finished) and ends
+    at the bottom of the next rise. If the series ends in a rise (e.g.
+    while charging), the last phase starts at that rise's top.
+    """
+    if not values:
+        return []
+    phases: list[tuple[int, int]] = []
+    start = 0
+    run_low = 0
+    for i in range(1, len(values)):
+        if values[i] < values[i - 1]:
+            if values[i - 1] - values[run_low] > rise_tol:
+                phases.append((start, run_low))
+                start = values.index(values[i - 1], run_low, i)
+            run_low = i
+    if values[-1] - values[run_low] > rise_tol:
+        phases.append((start, run_low))
+        start = values.index(values[-1], run_low)
+    phases.append((start, len(values) - 1))
+    return phases
+
+
+def _ends_in_rise(values: list[float], rise_tol: float) -> bool:
+    """Whether the series ends in a rise larger than *rise_tol*."""
+    k = len(values) - 1
+    while k > 0 and values[k - 1] <= values[k]:
+        k -= 1
+    return values[-1] - values[k] > rise_tol
+
+
+def _after_top(phase: list[Point]) -> list[Point]:
+    """The part of a phase from the first reading below its starting top.
+
+    For rechargeables the time spent at the top (still on the charger) is
+    no discharge, so the drain rate is measured from the first drop.
+    """
+    top = phase[0][1]
+    for i, (_, value) in enumerate(phase):
+        if value < top:
+            return phase[i:]
+    return []
+
+
+def _clean(
+    points: list[list[float]], spike_tol: float | None = None
+) -> list[Point]:
+    """Numeric points as sorted tuples, optionally without single spikes."""
+    pts = sorted((float(p[0]), float(p[1])) for p in points if p[1] is not None)
+    if spike_tol is not None:
+        pts = _despike(pts, spike_tol)
+    return pts
+
+
+def is_unconfirmed_drop(
+    raw_points: list[list[float]], now_ts: float, unit: str | None = None
 ) -> bool:
+    """The latest reading is a sudden large drop nothing has confirmed yet.
+
+    True if it is at least UNCONFIRMED_DROP_PP (voltages: the
+    UNCONFIRMED_DROP_RATIO share) below the reading before, it is the only
+    reading at that level and it is younger than UNCONFIRMED_DROP_HOURS. A
+    second low reading or the time limit confirms it; a reading back up
+    makes it a glitch, which _despike() removes from the history.
+    """
     if len(raw_points) < 2:
         return False
+    (_, before), (ts, value) = raw_points[-2], raw_points[-1]
+    if before is None or value is None:
+        return False
+    drop = before - value
+    limit = (
+        UNCONFIRMED_DROP_RATIO * abs(before)
+        if is_voltage_unit(unit)
+        else UNCONFIRMED_DROP_PP
+    )
+    return drop >= limit and now_ts - ts < UNCONFIRMED_DROP_HOURS * _HOUR
 
-    now = now_ts if now_ts is not None else dt_util.utcnow().timestamp()
-    cutoff = now - lookback_days * 86400
-    recent = [p for p in raw_points if p[0] >= cutoff]
 
-    for i in range(1, len(recent)):
-        prev, cur = recent[i - 1][1], recent[i][1]
-        if prev is not None and cur is not None and cur - prev > 10:
-            return True
-    return False
+def _despike(points: list[Point], tol: float) -> list[Point]:
+    """Drop isolated readings that jump by more than *tol* and straight back.
+
+    A glitch like 80 → 0 → 80 would otherwise look like a battery
+    replacement (the 0 → 80 rise). Only single readings whose neighbours
+    agree with each other are dropped.
+    """
+    if len(points) < 3:
+        return points
+    kept = [points[0]]
+    for i in range(1, len(points) - 1):
+        prev_v = kept[-1][1]
+        value = points[i][1]
+        next_v = points[i + 1][1]
+        if (
+            abs(value - prev_v) > tol
+            and abs(value - next_v) > tol
+            and abs(prev_v - next_v) <= tol / 2
+        ):
+            continue
+        kept.append(points[i])
+    kept.append(points[-1])
+    return kept
+
+
+def _voltage_reference(
+    values: list[float], unit: str | None
+) -> tuple[int, float, float]:
+    """(phase start, full, empty) voltage of the current battery.
+
+    *full* is the highest reading since the last replacement or recharge;
+    *empty* the lowest reading of the previous battery, or — as long as no
+    replacement has been observed — the typical cut-off voltage for this
+    battery type (VOLTAGE_EMPTY_TABLE).
+    """
+    phases = _discharge_phases(values, _voltage_rise_tol(values))
+    start, _ = phases[-1]
+    full = max(values[start:])
+    typical = _typical_empty_voltage(full, unit)
+    # Batteries are replaced every few months; a source that is recharged
+    # all the time (a car battery by its alternator, a node charged by
+    # hand) doesn't end its phases empty. Taken as "empty", a car's resting
+    # 12.5 V made 12.7 V critical.
+    if 1 < len(phases) < VOLTAGE_RECHARGED_MIN_PHASES:
+        prev_start, prev_end = phases[-2]
+        previous_empty = min(values[prev_start : prev_end + 1])
+        if previous_empty < full:
+            return start, full, previous_empty
+    return start, full, typical
+
+
+def _voltage_rise_tol(values: list[float]) -> float:
+    vmax = max(values)
+    return max(
+        ESTIMATE_VOLTAGE_RISE_RATIO * (vmax - min(values)),
+        ESTIMATE_VOLTAGE_RISE_MIN_RATIO * vmax,
+    )
+
+
+def _voltage_min_range(full: float, unit: str | None) -> float:
+    """Smallest voltage difference that is more than noise/quantization."""
+    return max(
+        VOLTAGE_MIN_RANGE_ABS / _volts_per_unit(unit),
+        VOLTAGE_MIN_RANGE_RATIO * full,
+    )
+
+
+def _typical_empty_voltage(full: float, unit: str | None) -> float:
+    scale = _volts_per_unit(unit)
+    full_volts = full * scale
+    for max_full, empty, _ in VOLTAGE_EMPTY_TABLE:
+        if full_volts <= max_full:
+            return empty / scale
+    return full * VOLTAGE_EMPTY_FALLBACK_RATIO
+
+
+def voltage_charge(
+    values: list[float], level: float, unit: str | None
+) -> tuple[float, float]:
+    """(remaining charge 0..1, typical lifetime in days) of a voltage battery.
+
+    The charge is the position of *level* between the battery's full and
+    empty voltage (see _voltage_reference); the lifetime comes from
+    VOLTAGE_EMPTY_TABLE by full voltage.
+    """
+    tol = _voltage_rise_tol(values)
+    cleaned = [v for _, v in _despike(list(enumerate(values)), tol)]
+    _, full, empty = _voltage_reference(cleaned, unit)
+    span = full - empty
+    fraction = min(max((level - empty) / span, 0.0), 1.0) if span > 0 else 1.0
+    full_volts = full * _volts_per_unit(unit)
+    for max_full, _, lifetime in VOLTAGE_EMPTY_TABLE:
+        if full_volts <= max_full:
+            return fraction, lifetime
+    return fraction, VOLTAGE_FALLBACK_LIFETIME_DAYS
+
+
+def _volts_per_unit(unit: str | None) -> float:
+    return 0.001 if unit and unit.lower() in ("mv", "millivolt") else 1.0
+
+
+def _plateau_level(values: list[float]) -> float:
+    """Mean of the top quarter of the values."""
+    sorted_desc = sorted(values, reverse=True)
+    top_n = max(1, len(sorted_desc) // 4)
+    return sum(sorted_desc[:top_n]) / top_n
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _now(now_ts: float | None) -> float:
+    return now_ts if now_ts is not None else dt_util.utcnow().timestamp()
 
 
 def _median(values: list[float]) -> float:
@@ -893,25 +1595,26 @@ def check_stale(
 
     A battery is stale when:
     - state unavailable/unknown for longer than STALE_UNAVAILABLE_HOURS, OR
-    - time since last data point exceeds max(3 × median reporting interval, 24 h).
+    - time since *last_update_ts* exceeds max(3 × median interval, 24 h).
+
+    The coordinator passes the last time the entity was seen with a valid
+    value (refreshed every update cycle), so in practice a battery becomes
+    stale once its entity has been unavailable/unknown for over an hour.
     """
     if last_update_ts is None:
         return False
 
-    if now_ts is None:
-        now_ts = dt_util.utcnow().timestamp()
+    elapsed = _now(now_ts) - last_update_ts
 
-    elapsed = now_ts - last_update_ts
-
-    if value_is_unavailable and elapsed > STALE_UNAVAILABLE_HOURS * 3600:
+    if value_is_unavailable and elapsed > STALE_UNAVAILABLE_HOURS * _HOUR:
         return True
 
     if median_interval is not None:
         threshold = max(
             STALE_MULTIPLIER * median_interval,
-            STALE_MIN_HOURS * 3600,
+            STALE_MIN_HOURS * _HOUR,
         )
     else:
-        threshold = STALE_MIN_HOURS * 3600
+        threshold = STALE_MIN_HOURS * _HOUR
 
     return elapsed > threshold

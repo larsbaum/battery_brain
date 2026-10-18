@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.sensor import SensorDeviceClass
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
     ATTR_FRIENDLY_NAME,
@@ -17,8 +18,8 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -27,33 +28,70 @@ from .analysis import (
     check_stale,
     classify_battery,
     derive_status,
+    detect_binary_replacements,
+    detect_replacements,
     estimate_remaining,
+    is_unconfirmed_drop,
+    is_voltage_unit,
 )
 from .const import (
+    ALERT_MODE_SMART,
+    ALERT_MODE_THRESHOLD,
+    ATTR_BATTERY_LEVEL,
     CATEGORY_BINARY,
+    CATEGORY_CONFIRMATIONS,
+    CATEGORY_LINEAR,
+    CATEGORY_LOW_STABLE,
+    CATEGORY_PLATEAU_CLIFF,
     CATEGORY_RECLASSIFY_INTERVAL,
     CATEGORY_UNKNOWN_DEFAULT,
+    CATEGORY_VOLTAGE,
     CONF_DEVELOPER_MODE,
     CONFIDENCE_DEFAULT,
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
     CONFIDENCE_MEDIUM,
     COORDINATOR_UPDATE_INTERVAL,
+    DEFAULT_WARNING_THRESHOLD,
     DOMAIN,
+    ESTIMATE_MAX_DAYS,
     LOGGER,
     LOW_CONFIDENCE_DAYS,
     MEDIUM_CONFIDENCE_DAYS,
     MIN_HISTORY_DAYS,
+    OPT_ALERT_MODE,
     OPT_BINARY_LOW_IS_CRITICAL,
     OPT_EXCLUDE_ENTITIES,
     OPT_EXCLUDE_INTEGRATIONS,
+    OPT_INCLUDE_VOLTAGE_SENSORS,
     OPT_SCAN_BATTERY_LEVEL_ATTR,
+    OPT_WARNING_THRESHOLD,
+    ORPHAN_GRACE_MINUTES,
+    SIMILAR_RATE_MIN_DAYS,
+    SIMILAR_RATE_MIN_DROP,
+    PRODUCTION_SNAPSHOT_INTERVAL,
+    REMAINING_MEASURED,
+    REMAINING_STALE,
     STATUS_CRITICAL,
     STATUS_NORMAL,
     STATUS_WARNING,
     TEST_MODE_TIME_FACTOR,
+    TEXT_BATTERY_LEVELS,
+    TEXT_LOW_LEVELS,
+    VOLTAGE_DISCOVERY_MAX,
+    VOLTAGE_DISCOVERY_MIN,
 )
-from .storage import BatteryHistoryStore, async_seed_from_recorder
+from .event_log import DEBUG_LOG_FILE, PRODUCTION_LOG_DIR, DebugLog, ProductionLog
+from .lifetime import Household, fallback_remaining
+from .storage import (
+    SOURCE_ATTRIBUTE,
+    SOURCE_STATE,
+    BatteryHistoryStore,
+    async_seed_from_recorder,
+)
+
+if TYPE_CHECKING:
+    from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, State
 
 
 @dataclass
@@ -71,6 +109,12 @@ class BatteryInfo:
     unit: str | None = None
     remaining_days: float | None = None
     estimated_empty: str | None = None
+    # measured / history / similar / typical / stale (see const.REMAINING_*)
+    remaining_source: str | None = None
+    # Attribute the value is read from (None: the entity's state).
+    source_attr: str | None = None
+    # "manufacturer|model" of the device, to learn from identical devices.
+    device_model: str | None = None
 
 
 @dataclass
@@ -107,20 +151,24 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
             config_entry=config_entry,
             update_interval=timedelta(seconds=COORDINATOR_UPDATE_INTERVAL),
         )
-        self._tracked_entities: set[str] = set()
-        self._unsub_state_listener: callback | None = None
         self.store = BatteryHistoryStore(hass)
         self._store_loaded = False
-        self._last_aggregation: float = 0.0
-
-        self._test_mode_active = False
-        self._test_mode_start_real: float = 0.0
-        self._test_mode_start_virtual: float = 0.0
-        self._time_factor: int = TEST_MODE_TIME_FACTOR
-        self._debug_logger: Any = None
-        self._production_logger: Any = None
+        self._tracked_entities: set[str] = set()
+        self._unsub_state_listener: CALLBACK_TYPE | None = None
+        config_entry.async_on_unload(self._async_unsubscribe_state_listener)
+        self._last_aggregation = 0.0
+        self._last_snapshot_log = 0.0
         self._reclassify_reason: str | None = None
         self._startup_complete = False
+
+        self._test_mode_active = False
+        self._test_mode_start_real = 0.0
+        self._test_mode_start_virtual = 0.0
+        self._time_factor: int = TEST_MODE_TIME_FACTOR
+
+        self._household = Household()
+        self._production_log: ProductionLog | None = None
+        self._debug_log: DebugLog | None = None
 
     @property
     def developer_mode(self) -> bool:
@@ -137,13 +185,26 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
     def mark_startup_complete(self) -> None:
         self._startup_complete = True
         if self.data is not None:
-            self.async_set_updated_data(self.data)
+            self.async_update_listeners()
 
-    def _reset_test_mode_meta(self) -> None:
-        """Ensure test mode is off in storage so it never auto-activates."""
-        if self.store.get_meta("test_mode_active", False):
-            self.store.set_meta("test_mode_active", False)
-            LOGGER.info("Test mode was active in storage — reset to off")
+    async def async_force_reclassify(self) -> None:
+        """Reset classification timestamps and trigger an immediate update."""
+        self.store.reset_all_last_classified()
+        self._reclassify_reason = "manual"
+        LOGGER.info("Forced reclassification triggered")
+        await self.async_refresh()
+
+    async def async_persist(self) -> None:
+        """Write history and logs to disk now (before unload/reload)."""
+        if self._store_loaded:
+            await self.store.async_save_immediate()
+        await self._async_flush_logs()
+
+    # ------------------------------------------------------------------
+    # Test mode (developer mode only): virtual time runs 200× faster.
+    # It always starts off; virtual timestamps end up in the stored
+    # history, so it must only be used with simulated batteries.
+    # ------------------------------------------------------------------
 
     def activate_test_mode(self) -> None:
         real_now = dt_util.utcnow().timestamp()
@@ -153,18 +214,24 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         self.update_interval = timedelta(
             seconds=COORDINATOR_UPDATE_INTERVAL / self._time_factor
         )
-        self.store.set_meta("test_mode_active", True)
-        self.store.set_meta("test_mode_start_real", real_now)
-        self.store.set_meta("test_mode_start_virtual", real_now)
         LOGGER.info("Test mode activated (time factor: %dx)", self._time_factor)
-        self._log_test_mode_change(True)
+        self._log_event(
+            "test_mode_change",
+            production=False,
+            active=True,
+            time_factor=self._time_factor,
+        )
 
     def deactivate_test_mode(self) -> None:
         self._test_mode_active = False
         self.update_interval = timedelta(seconds=COORDINATOR_UPDATE_INTERVAL)
-        self.store.set_meta("test_mode_active", False)
         LOGGER.info("Test mode deactivated")
-        self._log_test_mode_change(False)
+        self._log_event(
+            "test_mode_change",
+            production=False,
+            active=False,
+            time_factor=self._time_factor,
+        )
 
     def _get_now_ts(self) -> float:
         real_now = dt_util.utcnow().timestamp()
@@ -173,374 +240,11 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         elapsed = real_now - self._test_mode_start_real
         return self._test_mode_start_virtual + elapsed * self._time_factor
 
-    def _persist_test_mode_checkpoint(self) -> None:
-        """Save current virtual time anchor so restarts can resume."""
-        real_now = dt_util.utcnow().timestamp()
-        virtual_now = self._get_now_ts()
-        self._test_mode_start_real = real_now
-        self._test_mode_start_virtual = virtual_now
-        self.store.set_meta("test_mode_start_real", real_now)
-        self.store.set_meta("test_mode_start_virtual", virtual_now)
-
-    # ------------------------------------------------------------------
-    # Debug logging (developer mode only)
-    # ------------------------------------------------------------------
-
-    def _init_debug_logger(self) -> None:
-        from .debug_log import DebugLogger
-
-        path = self.hass.config.path(f"{DOMAIN}_debug.jsonl")
-        self._debug_logger = DebugLogger(path)
-        LOGGER.info("Debug log active: %s", path)
-        self._debug_logger.log(
-            {
-                "type": "start",
-                "real_ts": dt_util.utcnow().timestamp(),
-                "real_iso": dt_util.utcnow().isoformat(),
-                "developer_mode": True,
-                "test_mode_active": self._test_mode_active,
-                "time_factor": self._time_factor,
-                "options": dict(self.config_entry.options),
-                "config_data": {
-                    k: v
-                    for k, v in self.config_entry.data.items()
-                    if k != "password"
-                },
-            }
-        )
-
-    def _ts_iso(self, ts: float) -> str:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-
-    def _log_update(self, data: BatteryBrainData) -> None:
-        if self._debug_logger is None:
-            return
-
-        now_real = dt_util.utcnow().timestamp()
-        now_virtual = self._get_now_ts()
-
-        batteries_snapshot: dict[str, Any] = {}
-        for entity_id, info in data.batteries.items():
-            raw = self.store.get_raw_points(entity_id)
-            recent_vals = [p[1] for p in raw[-10:]] if raw else []
-            batteries_snapshot[entity_id] = {
-                "name": info.name,
-                "value": info.last_value,
-                "category": info.category,
-                "status": info.status,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "remaining_days": info.remaining_days,
-                "is_binary": info.is_binary,
-                "unit": info.unit,
-                "history_days": round(
-                    self.store.get_history_days(
-                        entity_id, now_ts=now_virtual
-                    ),
-                    2,
-                ),
-                "raw_points_count": len(raw),
-                "daily_summaries_count": len(
-                    self.store.get_daily_summaries(entity_id)
-                ),
-                "median_interval_s": self.store.get_median_interval(
-                    entity_id
-                ),
-                "last_update_ts": self.store.get_last_update_ts(entity_id),
-                "recent_values": recent_vals,
-            }
-
-        self._debug_logger.log(
-            {
-                "type": "update",
-                "real_ts": now_real,
-                "real_iso": self._ts_iso(now_real),
-                "virtual_ts": now_virtual,
-                "virtual_iso": self._ts_iso(now_virtual),
-                "test_mode": self._test_mode_active,
-                "time_factor": (
-                    self._time_factor if self._test_mode_active else 1
-                ),
-                "update_interval_s": self.update_interval.total_seconds(),
-                "sensors": {
-                    "normal": len(data.normal),
-                    "warning": len(data.warning),
-                    "critical": len(data.critical),
-                    "total": len(data.batteries),
-                },
-                "batteries": batteries_snapshot,
-            }
-        )
-
-    def _log_state_change(
-        self,
-        entity_id: str,
-        old_state_str: str | None,
-        new_state_str: str,
-        info: BatteryInfo,
-    ) -> None:
-        if self._debug_logger is None:
-            return
-
-        now_real = dt_util.utcnow().timestamp()
-        self._debug_logger.log(
-            {
-                "type": "state_change",
-                "real_ts": now_real,
-                "real_iso": self._ts_iso(now_real),
-                "virtual_ts": self._get_now_ts(),
-                "entity_id": entity_id,
-                "old_state": old_state_str,
-                "new_state": new_state_str,
-                "status": info.status,
-                "category": info.category,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "value": info.last_value,
-            }
-        )
-
-    def _log_classification(
-        self,
-        entity_id: str,
-        old_category: str | None,
-        new_category: str,
-        *,
-        reason: str = "interval",
-        category_changed: bool = True,
-        old_status: str | None = None,
-        current_value: float | str | None = None,
-    ) -> None:
-        if self._debug_logger is None:
-            return
-
-        now_real = dt_util.utcnow().timestamp()
-        values = self.store.get_all_values(entity_id)
-        raw = self.store.get_raw_points(entity_id)
-        self._debug_logger.log(
-            {
-                "type": "classification",
-                "real_ts": now_real,
-                "real_iso": self._ts_iso(now_real),
-                "virtual_ts": self._get_now_ts(),
-                "entity_id": entity_id,
-                "old_category": old_category,
-                "new_category": new_category,
-                "category_changed": category_changed,
-                "reason": reason,
-                "old_status": old_status,
-                "current_value": current_value,
-                "history_days": round(
-                    self.store.get_history_days(
-                        entity_id, now_ts=self._get_now_ts()
-                    ),
-                    2,
-                ),
-                "raw_points_count": len(raw),
-                "all_values_count": len(values),
-                "all_values": values,
-            }
-        )
-
-    def _log_test_mode_change(self, active: bool) -> None:
-        if self._debug_logger is None:
-            return
-
-        now_real = dt_util.utcnow().timestamp()
-        self._debug_logger.log(
-            {
-                "type": "test_mode_change",
-                "real_ts": now_real,
-                "real_iso": self._ts_iso(now_real),
-                "virtual_ts": self._get_now_ts(),
-                "active": active,
-                "time_factor": self._time_factor,
-            }
-        )
-
-    def _log_stale_change(
-        self, entity_id: str, info: BatteryInfo
-    ) -> None:
-        if self._debug_logger is None:
-            return
-
-        now_real = dt_util.utcnow().timestamp()
-        self._debug_logger.log(
-            {
-                "type": "stale_change",
-                "real_ts": now_real,
-                "real_iso": self._ts_iso(now_real),
-                "virtual_ts": self._get_now_ts(),
-                "entity_id": entity_id,
-                "stale": info.stale,
-                "status": info.status,
-                "category": info.category,
-                "value": info.last_value,
-            }
-        )
-
-    # ------------------------------------------------------------------
-    # Production logging (always on)
-    # ------------------------------------------------------------------
-
-    def _init_production_logger(self) -> None:
-        from .production_log import LOG_DIR, ProductionLogger
-
-        base_dir = self.hass.config.path(LOG_DIR)
-        self._production_logger = ProductionLogger(base_dir)
-        LOGGER.info("Production log directory: %s", base_dir)
-        self._production_logger.log(
-            {
-                "type": "start",
-                "ts": dt_util.utcnow().timestamp(),
-                "iso": dt_util.utcnow().isoformat(),
-                "options": {
-                    k: v
-                    for k, v in self.config_entry.options.items()
-                    if k != "password"
-                },
-            }
-        )
-
-    def _prod_log_update(self, data: BatteryBrainData) -> None:
-        if self._production_logger is None:
-            return
-
-        now = dt_util.utcnow().timestamp()
-        now_for_store = self._get_now_ts()
-
-        batteries_snapshot: dict[str, Any] = {}
-        for entity_id, info in data.batteries.items():
-            raw = self.store.get_raw_points(entity_id)
-            batteries_snapshot[entity_id] = {
-                "name": info.name,
-                "value": info.last_value,
-                "category": info.category,
-                "status": info.status,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "remaining_days": info.remaining_days,
-                "is_binary": info.is_binary,
-                "unit": info.unit,
-                "history_days": round(
-                    self.store.get_history_days(
-                        entity_id, now_ts=now_for_store
-                    ),
-                    2,
-                ),
-                "raw_points_count": len(raw),
-                "daily_summaries_count": len(
-                    self.store.get_daily_summaries(entity_id)
-                ),
-            }
-
-        self._production_logger.log(
-            {
-                "type": "update",
-                "ts": now,
-                "iso": self._ts_iso(now),
-                "update_interval_s": self.update_interval.total_seconds(),
-                "sensors": {
-                    "normal": len(data.normal),
-                    "warning": len(data.warning),
-                    "critical": len(data.critical),
-                    "total": len(data.batteries),
-                },
-                "batteries": batteries_snapshot,
-            }
-        )
-
-    def _prod_log_state_change(
-        self,
-        entity_id: str,
-        old_state_str: str | None,
-        new_state_str: str,
-        info: BatteryInfo,
-    ) -> None:
-        if self._production_logger is None:
-            return
-
-        now = dt_util.utcnow().timestamp()
-        self._production_logger.log(
-            {
-                "type": "state_change",
-                "ts": now,
-                "iso": self._ts_iso(now),
-                "entity_id": entity_id,
-                "old_state": old_state_str,
-                "new_state": new_state_str,
-                "status": info.status,
-                "category": info.category,
-                "confidence": info.confidence,
-                "stale": info.stale,
-                "value": info.last_value,
-            }
-        )
-
-    def _prod_log_classification(
-        self,
-        entity_id: str,
-        old_category: str | None,
-        new_category: str,
-        *,
-        reason: str = "interval",
-        category_changed: bool = True,
-        old_status: str | None = None,
-        current_value: float | str | None = None,
-    ) -> None:
-        if self._production_logger is None:
-            return
-
-        now = dt_util.utcnow().timestamp()
-        raw = self.store.get_raw_points(entity_id)
-        self._production_logger.log(
-            {
-                "type": "classification",
-                "ts": now,
-                "iso": self._ts_iso(now),
-                "entity_id": entity_id,
-                "old_category": old_category,
-                "new_category": new_category,
-                "category_changed": category_changed,
-                "reason": reason,
-                "old_status": old_status,
-                "current_value": current_value,
-                "history_days": round(
-                    self.store.get_history_days(
-                        entity_id, now_ts=self._get_now_ts()
-                    ),
-                    2,
-                ),
-                "raw_points_count": len(raw),
-            }
-        )
-
-    def _prod_log_stale_change(
-        self, entity_id: str, info: BatteryInfo
-    ) -> None:
-        if self._production_logger is None:
-            return
-
-        now = dt_util.utcnow().timestamp()
-        self._production_logger.log(
-            {
-                "type": "stale_change",
-                "ts": now,
-                "iso": self._ts_iso(now),
-                "entity_id": entity_id,
-                "stale": info.stale,
-                "status": info.status,
-                "category": info.category,
-                "value": info.last_value,
-            }
-        )
-
-    async def async_force_reclassify(self) -> None:
-        """Reset classification timestamps and trigger an immediate update."""
-        self.store.reset_all_last_classified()
-        self._reclassify_reason = "manual"
-        LOGGER.info("Forced reclassification triggered")
-        await self.async_refresh()
+    def _scaled(self, seconds: float) -> float:
+        """An interval in (possibly virtual) store time."""
+        if self._test_mode_active:
+            return seconds / self._time_factor
+        return seconds
 
     # ------------------------------------------------------------------
     # Core update loop
@@ -550,34 +254,51 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
         if not self._store_loaded:
             await self.store.async_load()
             self._store_loaded = True
-            self._init_production_logger()
-            if self.developer_mode:
-                self._reset_test_mode_meta()
-                self._init_debug_logger()
+            self._init_logs()
 
-        if self._test_mode_active:
-            self._persist_test_mode_checkpoint()
+        # Write the logs of the last cycle and of live events now: no await
+        # may come between reading the states and returning the result,
+        # otherwise live values processed meanwhile would be overwritten
+        # with the older ones read here.
+        await self._async_flush_logs()
+
+        now = self._get_now_ts()
+        previous = self.data.batteries if self.data is not None else {}
+        manual = self._reclassify_reason == "manual"
+        self._reclassify_reason = None
 
         batteries = self._discover_batteries()
-        await self._seed_new_batteries(batteries)
-        self._record_current_values(batteries)
-        self._classify_batteries(batteries)
-        self._derive_all_status(batteries)
-        self._apply_stale_overlay(batteries)
-        self._estimate_all_remaining(batteries)
-        self._update_confidence(batteries)
-        self._maybe_aggregate()
+        seeded = await self._seed_new_batteries(batteries)
+        if seeded:
+            # The import awaited the recorder: read the states again.
+            batteries = self._discover_batteries()
+            # Imported history older than HISTORY_RAW_DAYS becomes daily means
+            # right away: the first classification must see the same data as
+            # every later one (hourly points for a year classified
+            # differently, so archetypes changed hours after installing).
+            self.store.aggregate(now_ts=now)
+            self._last_aggregation = now
+        self._household = self._build_household(batteries, previous)
+
+        for entity_id, info in batteries.items():
+            self.store.ensure_source(
+                entity_id,
+                SOURCE_ATTRIBUTE if info.source_attr else SOURCE_STATE,
+                now_ts=now,
+            )
+            self._ingest(entity_id, info, now)
+            self._classify(entity_id, info, now, manual, previous.get(entity_id))
+            self._sync_replacements(entity_id, info, now)
+            self._evaluate(entity_id, info, previous.get(entity_id))
+            info.confidence = self._confidence(entity_id, now)
+
+        if now - self._last_aggregation > self._scaled(86400):
+            self.store.aggregate(now_ts=now)
+            self._last_aggregation = now
 
         data = BatteryBrainData(batteries=batteries)
-        self._update_state_listeners(set(batteries.keys()))
-
-        self._log_update(data)
-        self._prod_log_update(data)
-        if self._debug_logger is not None:
-            await self._debug_logger.async_flush(self.hass)
-        if self._production_logger is not None:
-            await self._production_logger.async_flush(self.hass)
-
+        self._update_state_listener(set(batteries))
+        self._log_update(data)  # written at the start of the next cycle
         return data
 
     # ------------------------------------------------------------------
@@ -585,445 +306,671 @@ class BatteryBrainCoordinator(DataUpdateCoordinator[BatteryBrainData]):
     # ------------------------------------------------------------------
 
     def _discover_batteries(self) -> dict[str, BatteryInfo]:
-        exclude = set(
-            self.config_entry.options.get(OPT_EXCLUDE_ENTITIES, [])
-        )
-        exclude_integrations = set(
-            self.config_entry.options.get(OPT_EXCLUDE_INTEGRATIONS, [])
-        )
-        if exclude_integrations:
-            ent_reg = er.async_get(self.hass)
-            for entry in ent_reg.entities.values():
-                if entry.platform in exclude_integrations:
-                    exclude.add(entry.entity_id)
-        scan_attr = self.config_entry.options.get(
-            OPT_SCAN_BATTERY_LEVEL_ATTR, False
-        )
+        options = self.config_entry.options
+        exclude = set(options.get(OPT_EXCLUDE_ENTITIES, []))
+        exclude_integrations = set(options.get(OPT_EXCLUDE_INTEGRATIONS, []))
+        include_voltage = options.get(OPT_INCLUDE_VOLTAGE_SENSORS, True)
+        ent_reg = er.async_get(self.hass)
+        dev_reg = dr.async_get(self.hass)
+
+        def add(state: State, **kwargs: Any) -> None:
+            """Add the battery unless excluded; note its device model."""
+            entry = ent_reg.async_get(state.entity_id)
+            if state.entity_id in exclude or (
+                entry is not None and entry.platform in exclude_integrations
+            ):
+                return
+            if self._is_orphan(state, entry):
+                return
+            info = self._build_battery_info(state, **kwargs)
+            device = (
+                dev_reg.async_get(entry.device_id)
+                if entry is not None and entry.device_id
+                else None
+            )
+            if device is not None and device.model:
+                info.device_model = f"{device.manufacturer or ''}|{device.model}"
+            batteries[state.entity_id] = info
+
         batteries: dict[str, BatteryInfo] = {}
-
-        for state in self.hass.states.async_all("sensor"):
-            if state.entity_id in exclude:
-                continue
-            if (
-                state.attributes.get(ATTR_DEVICE_CLASS)
-                == SensorDeviceClass.BATTERY
+        for state in self.hass.states.async_all(("sensor", "binary_sensor")):
+            device_class = state.attributes.get(ATTR_DEVICE_CLASS)
+            if state.domain == "binary_sensor":
+                if device_class == BinarySensorDeviceClass.BATTERY:
+                    add(state, is_binary=True)
+            elif device_class == SensorDeviceClass.BATTERY or (
+                device_class == SensorDeviceClass.VOLTAGE
+                and include_voltage
+                and self._is_battery_voltage(state)
             ):
-                batteries[state.entity_id] = self._build_battery_info(
-                    state.entity_id, state.state, state.attributes
-                )
+                add(state)
 
-        # Also discover sensors with device_class: voltage in battery voltage range.
-        # Some integrations (e.g. custom components) report battery voltage using the
-        # voltage device class instead of the battery device class.
-        for state in self.hass.states.async_all("sensor"):
-            if state.entity_id in exclude or state.entity_id in batteries:
-                continue
-            if (
-                state.attributes.get(ATTR_DEVICE_CLASS)
-                == SensorDeviceClass.VOLTAGE
+        if options.get(OPT_SCAN_BATTERY_LEVEL_ATTR, False):
+            for state in self.hass.states.async_all(
+                ("sensor", "binary_sensor", "device_tracker")
             ):
-                try:
-                    val = float(state.state)
-                except (ValueError, TypeError):
-                    continue
-                # Filter: only battery-range voltages (0.3–20 V), not mains voltage
-                if 0.3 < val <= 20.0:
-                    batteries[state.entity_id] = self._build_battery_info(
-                        state.entity_id, state.state, state.attributes
-                    )
-
-        for state in self.hass.states.async_all("binary_sensor"):
-            if state.entity_id in exclude:
-                continue
-            if (
-                state.attributes.get(ATTR_DEVICE_CLASS)
-                == BinarySensorDeviceClass.BATTERY
-            ):
-                batteries[state.entity_id] = self._build_battery_info(
-                    state.entity_id,
-                    state.state,
-                    state.attributes,
-                    is_binary=True,
-                )
-
-        if scan_attr:
-            for domain in ("sensor", "binary_sensor", "device_tracker"):
-                for state in self.hass.states.async_all(domain):
-                    if state.entity_id in exclude:
-                        continue
-                    if state.entity_id in batteries:
-                        continue
-                    if "battery_level" in state.attributes:
-                        batteries[state.entity_id] = self._build_battery_info(
-                            state.entity_id,
-                            str(state.attributes["battery_level"]),
-                            state.attributes,
-                        )
+                if (
+                    state.entity_id not in batteries
+                    and ATTR_BATTERY_LEVEL in state.attributes
+                ):
+                    add(state, source_attr=ATTR_BATTERY_LEVEL)
 
         return batteries
 
-    def _build_battery_info(
-        self,
-        entity_id: str,
-        state_value: str,
-        attributes: dict[str, Any],
-        *,
-        is_binary: bool = False,
-    ) -> BatteryInfo:
-        name = attributes.get(ATTR_FRIENDLY_NAME, entity_id)
-        unit = attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+    def _is_orphan(self, state: State, entry: Any) -> bool:
+        """An entity nothing provides any more (left behind in the registry).
 
-        if state_value in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            last_value: float | str | None = None
-        elif is_binary:
-            last_value = state_value
-        else:
-            last_value = self._try_float(state_value)
+        HA restores registry entities as ``unavailable`` with
+        ``restored: true`` until their integration provides them. If that
+        still holds ORPHAN_GRACE_MINUTES later and the entity has no config
+        entry (YAML, no longer defined), its config entry is gone, or the
+        config entry is loaded but doesn't provide it (device removed), it
+        is an orphan and would stay "unreachable" (critical) forever.
+        Entities of a config entry that failed to load stay monitored:
+        their batteries really are unreachable.
+        """
+        if state.attributes.get("restored") is not True:
+            return False
+        updated = getattr(state, "last_updated", None)
+        if updated is None or (
+            dt_util.utcnow() - updated
+        ).total_seconds() < ORPHAN_GRACE_MINUTES * 60:
+            return False
+        config_entry_id = getattr(entry, "config_entry_id", None)
+        if config_entry_id is None:
+            return True
+        config_entry = self.hass.config_entries.async_get_entry(config_entry_id)
+        return config_entry is None or config_entry.state is ConfigEntryState.LOADED
 
-        return BatteryInfo(
-            name=name,
-            source_entity=entity_id,
-            category=CATEGORY_BINARY if is_binary else CATEGORY_UNKNOWN_DEFAULT,
-            status=STATUS_NORMAL,
-            last_value=last_value,
-            confidence=CONFIDENCE_DEFAULT,
-            stale=False,
-            is_binary=is_binary,
-            unit=unit,
-        )
+    def _is_battery_voltage(self, state: State) -> bool:
+        """Voltage sensor in battery range (or already tracked)."""
+        if self.store.has_battery(state.entity_id):
+            return True
+        try:
+            volts = float(state.state)
+        except (ValueError, TypeError):
+            return False
+        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+        if unit and unit.lower() == "mv":
+            volts /= 1000
+        return VOLTAGE_DISCOVERY_MIN < volts <= VOLTAGE_DISCOVERY_MAX
 
     @staticmethod
-    def _try_float(value: str) -> float | str | None:
+    def _build_battery_info(
+        state: State,
+        *,
+        is_binary: bool = False,
+        source_attr: str | None = None,
+    ) -> BatteryInfo:
+        if state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            last_value: float | str | None = None
+        elif is_binary:
+            last_value = state.state
+        elif source_attr is not None:
+            last_value = _try_float(state.attributes.get(source_attr))
+        else:
+            last_value = _try_float(state.state)
+
+        return BatteryInfo(
+            name=state.attributes.get(ATTR_FRIENDLY_NAME, state.entity_id),
+            source_entity=state.entity_id,
+            category=CATEGORY_BINARY if is_binary else CATEGORY_UNKNOWN_DEFAULT,
+            last_value=last_value,
+            is_binary=is_binary,
+            # battery_level attributes are percentages; the host entity's
+            # unit (e.g. °C) has nothing to do with them.
+            unit="%" if source_attr else state.attributes.get(ATTR_UNIT_OF_MEASUREMENT),
+            source_attr=source_attr,
+        )
+
+    # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
+
+    async def _seed_new_batteries(self, batteries: dict[str, BatteryInfo]) -> bool:
+        """Import recorder history for batteries seen for the first time.
+
+        Attribute-based batteries are not imported: the recorder history
+        of their entity is the host entity's state, not the battery level.
+        Returns True if history was imported.
+        """
+        new = [
+            info
+            for entity_id, info in batteries.items()
+            if not self.store.is_seeded(entity_id)
+        ]
+        for info in new:
+            if info.source_attr is not None:
+                self.store.mark_seeded(info.source_entity)
+        to_seed = [i.source_entity for i in new if i.source_attr is None]
+        if not to_seed:
+            return False
         try:
-            return float(value)
-        except (ValueError, TypeError):
-            return value if value else None
+            await async_seed_from_recorder(
+                self.hass,
+                self.store,
+                to_seed,
+                {i.source_entity for i in new if i.is_binary},
+            )
+        except Exception:  # noqa: BLE001 - never block the update cycle
+            LOGGER.warning("Failed to seed battery history", exc_info=True)
+            for entity_id in to_seed:
+                self.store.mark_seeded(entity_id)
+        return True
+
+    def _ingest(self, entity_id: str, info: BatteryInfo, now: float) -> None:
+        """Mark the battery alive; record its value (only when it changed)."""
+        if info.last_value is None:
+            return
+        self.store.set_last_seen(entity_id, now)
+        value = _battery_level(info)
+        if value is None:
+            return
+        raw = self.store.get_raw_points(entity_id)
+        if not raw or raw[-1][1] != value:
+            self.store.add_point(entity_id, now, value)
+
+    def _confidence(self, entity_id: str, now: float) -> str:
+        days = self.store.get_history_days(entity_id, now_ts=now)
+        if days < MIN_HISTORY_DAYS:
+            return CONFIDENCE_DEFAULT
+        if days < LOW_CONFIDENCE_DAYS:
+            return CONFIDENCE_LOW
+        if days < MEDIUM_CONFIDENCE_DAYS:
+            return CONFIDENCE_MEDIUM
+        return CONFIDENCE_HIGH
 
     # ------------------------------------------------------------------
     # Classification
     # ------------------------------------------------------------------
 
-    def _classify_batteries(
-        self, batteries: dict[str, BatteryInfo]
-    ) -> None:
-        now = self._get_now_ts()
-        reclassify_interval = CATEGORY_RECLASSIFY_INTERVAL
-        if self._test_mode_active:
-            reclassify_interval /= self._time_factor
-
-        reason_override = self._reclassify_reason
-        self._reclassify_reason = None
-
-        for entity_id, info in batteries.items():
-            stored_cat = self.store.get_category(entity_id)
-            last_classified = self.store.get_last_classified(entity_id)
-
-            if (
-                stored_cat
-                and last_classified
-                and (now - last_classified) < reclassify_interval
-            ):
-                info.category = stored_cat
-                continue
-
-            old_cat = stored_cat
-            if info.is_binary:
-                info.category = CATEGORY_BINARY
-            elif (
-                self.store.get_history_days(entity_id, now_ts=now)
-                >= MIN_HISTORY_DAYS
-            ):
-                values = self.store.get_all_values(entity_id)
-                info.category = classify_battery(
-                    values, is_binary=False, unit=info.unit
-                )
-            else:
-                info.category = CATEGORY_UNKNOWN_DEFAULT
-
-            if stored_cat is None:
-                reason = "first"
-            elif reason_override == "manual":
-                reason = "manual"
-            else:
-                reason = "interval"
-
-            category_changed = info.category != old_cat
-            old_status = None
-            if self.data and entity_id in self.data.batteries:
-                old_status = self.data.batteries[entity_id].status
-
-            self._log_classification(
-                entity_id,
-                old_cat,
-                info.category,
-                reason=reason,
-                category_changed=category_changed,
-                old_status=old_status,
-                current_value=info.last_value,
-            )
-            self._prod_log_classification(
-                entity_id,
-                old_cat,
-                info.category,
-                reason=reason,
-                category_changed=category_changed,
-                old_status=old_status,
-                current_value=info.last_value,
-            )
-
-            self.store.set_category(entity_id, info.category, now_ts=now)
-
-    # ------------------------------------------------------------------
-    # Status derivation
-    # ------------------------------------------------------------------
-
-    def _derive_all_status(
-        self, batteries: dict[str, BatteryInfo]
-    ) -> None:
-        binary_critical = self.config_entry.options.get(
-            OPT_BINARY_LOW_IS_CRITICAL, False
-        )
-        for entity_id, info in batteries.items():
-            info.status = self._derive_single_status(
-                entity_id, info, binary_critical
-            )
-
-    def _derive_single_status(
+    def _classify(
         self,
         entity_id: str,
         info: BatteryInfo,
-        binary_critical: bool,
+        now: float,
+        manual: bool,
+        previous: BatteryInfo | None,
+    ) -> None:
+        stored = self.store.get_category(entity_id)
+        last_classified = self.store.get_last_classified(entity_id)
+        if (
+            stored
+            and last_classified
+            and now - last_classified < self._scaled(CATEGORY_RECLASSIFY_INTERVAL)
+        ):
+            info.category = stored
+            return
+
+        all_points = self.store.get_all_points(entity_id)
+        if info.is_binary:
+            result = CATEGORY_BINARY
+        elif is_voltage_unit(info.unit):
+            # The unit is conclusive; no need to wait for MIN_HISTORY_DAYS
+            # (percentage thresholds would rate 2.9 V as critical).
+            result = CATEGORY_VOLTAGE
+        elif self.store.get_history_days(entity_id, now_ts=now) >= MIN_HISTORY_DAYS:
+            result = classify_battery(
+                [p[1] for p in all_points],
+                unit=info.unit,
+                points=all_points,
+                now_ts=now,
+            )
+        else:
+            result = CATEGORY_UNKNOWN_DEFAULT
+
+        if stored is None:
+            reason = "first"
+        elif manual:
+            reason = "manual"
+        else:
+            reason = "interval"
+        info.category = self._confirmed_category(
+            entity_id, stored, result, immediate=reason != "interval"
+        )
+
+        # Production log: hourly re-checks only when something happens (the
+        # archetype changed or another one waits for confirmation); the
+        # hourly "update" snapshot has every battery's category anyway.
+        # With hundreds of batteries the unchanged ones made up a third of
+        # the log. The debug log keeps all of them.
+        self._log_event(
+            "classification",
+            production=reason != "interval"
+            or info.category != stored
+            or result != info.category,
+            entity_id=entity_id,
+            old_category=stored,
+            new_category=info.category,
+            category_changed=info.category != stored,
+            candidate=result,
+            reason=reason,
+            old_status=previous.status if previous else None,
+            current_value=info.last_value,
+            history_days=round(self.store.get_history_days(entity_id, now_ts=now), 2),
+            raw_points_count=len(self.store.get_raw_points(entity_id)),
+            debug_extra={
+                "all_values_count": len(all_points),
+                "all_values": [p[1] for p in all_points],
+            },
+        )
+        self.store.set_category(entity_id, info.category, now_ts=now)
+
+    def _sync_replacements(
+        self, entity_id: str, info: BatteryInfo, now: float
+    ) -> None:
+        """Store the battery replacements seen in the history (every cycle)."""
+        all_points = self.store.get_all_points(entity_id)
+        if info.is_binary:
+            detected: list[float] | None = detect_binary_replacements(all_points)
+        elif info.category in (
+            CATEGORY_LINEAR,
+            CATEGORY_PLATEAU_CLIFF,
+            CATEGORY_LOW_STABLE,
+        ):
+            detected = detect_replacements(all_points)
+        else:
+            detected = None  # rises are charging, not new batteries
+        self.store.sync_replacements(
+            entity_id, detected, all_points[0][0] if all_points else now
+        )
+
+    def _confirmed_category(
+        self, entity_id: str, stored: str | None, result: str, *, immediate: bool
     ) -> str:
+        """Apply the classification hysteresis (CATEGORY_CONFIRMATIONS)."""
+        if immediate or stored in (None, CATEGORY_UNKNOWN_DEFAULT) or result == stored:
+            self.store.set_pending_category(entity_id, None)
+            return result
+        pending, count = self.store.get_pending_category(entity_id)
+        count = count + 1 if pending == result else 1
+        if count >= CATEGORY_CONFIRMATIONS:
+            self.store.set_pending_category(entity_id, None)
+            return result
+        self.store.set_pending_category(entity_id, result, count)
+        return stored
+
+    # ------------------------------------------------------------------
+    # Status, stale overlay and remaining lifetime (one battery)
+    # ------------------------------------------------------------------
+
+    def _evaluate(
+        self, entity_id: str, info: BatteryInfo, previous: BatteryInfo | None
+    ) -> None:
+        now = self._get_now_ts()
         all_points = self.store.get_all_points(entity_id)
         raw_points = self.store.get_raw_points(entity_id)
-        return derive_status(
+
+        level = _battery_level(info)
+        rated = (
+            # Text levels ("low", …) are rated by their percent equivalent.
+            level if isinstance(info.last_value, str) and not info.is_binary
+            else info.last_value
+        )
+        if (
+            not info.is_binary
+            and isinstance(level, (int, float))
+            and raw_points
+            and raw_points[-1][1] == level
+            and is_unconfirmed_drop(raw_points, now, info.unit)
+        ):
+            # A sudden drop (e.g. a single 0 % from a Z-Wave device) only
+            # counts once confirmed; until then rate the reading before.
+            glitch_ts = raw_points[-1][0]
+            raw_points = raw_points[:-1]
+            all_points = [p for p in all_points if p[0] != glitch_ts]
+            level = rated = raw_points[-1][1]
+        options = self.config_entry.options
+        info.status = derive_status(
             info.category,
-            info.last_value,
+            rated,
             [p[1] for p in all_points],
             raw_points,
             is_binary=info.is_binary,
-            binary_low_is_critical=binary_critical,
-            now_ts=self._get_now_ts(),
+            binary_low_is_critical=options.get(OPT_BINARY_LOW_IS_CRITICAL, False),
+            now_ts=now,
             all_points=all_points,
+            unit=info.unit,
+            alert_threshold=_alert_threshold(options),
+            text_low=_is_text_low(info),
         )
 
-    # ------------------------------------------------------------------
-    # Remaining-lifetime estimation
-    # ------------------------------------------------------------------
-
-    def _estimate_all_remaining(
-        self, batteries: dict[str, BatteryInfo]
-    ) -> None:
-        for entity_id, info in batteries.items():
-            self._estimate_single_remaining(entity_id, info)
-
-    def _estimate_single_remaining(
-        self, entity_id: str, info: BatteryInfo
-    ) -> None:
-        info.remaining_days = None
-        info.estimated_empty = None
+        info.stale = check_stale(
+            last_update_ts=self.store.get_last_seen_ts(entity_id)
+            or self.store.get_last_update_ts(entity_id),
+            median_interval=self.store.get_median_interval(entity_id),
+            value_is_unavailable=info.last_value is None,
+            now_ts=now,
+        )
         if info.stale:
-            return
+            info.status = STATUS_CRITICAL
+        if info.stale != (previous.stale if previous else False):
+            self._log_event(
+                "stale_change",
+                entity_id=entity_id,
+                stale=info.stale,
+                status=info.status,
+                category=info.category,
+                value=info.last_value,
+            )
 
-        remaining = estimate_remaining(
-            info.category,
-            info.last_value,
-            self.store.get_raw_points(entity_id),
-            self.store.get_all_points(entity_id),
-            now_ts=self._get_now_ts(),
-        )
+        # Remaining lifetime: always estimated. Unavailable/stale batteries
+        # use their last known reading.
+        if level is None and raw_points:
+            level = raw_points[-1][1]
+        remaining: float | None = None
+        source = REMAINING_MEASURED
+        if level is not None and not info.is_binary:
+            remaining = estimate_remaining(
+                info.category,
+                level,
+                raw_points,
+                all_points,
+                now_ts=now,
+                unit=info.unit,
+            )
         if remaining is None:
-            return
-
+            remaining, source = fallback_remaining(
+                entity_id=entity_id,
+                category=info.category,
+                level=level,
+                unit=info.unit,
+                raw_points=raw_points,
+                all_points=all_points,
+                replacements=self.store.get_replacements(entity_id),
+                first_seen=self.store.get_first_seen(entity_id) or now,
+                now=now,
+                model=info.device_model,
+                household=self._household,
+            )
+        if info.stale:
+            source = REMAINING_STALE
+        remaining = min(max(remaining, 0.0), ESTIMATE_MAX_DAYS)
         info.remaining_days = round(remaining, 1)
+        info.remaining_source = source
         # remaining is in (possibly virtual) store time; convert to real time.
-        real_seconds = remaining * 86400
-        if self._test_mode_active:
-            real_seconds /= self._time_factor
-        try:
-            empty_at = dt_util.utcnow() + timedelta(seconds=real_seconds)
-        except OverflowError:
-            # Near-flat trend: beyond year 9999, no representable date.
-            return
+        empty_at = dt_util.utcnow() + timedelta(
+            seconds=self._scaled(remaining * 86400)
+        )
         info.estimated_empty = dt_util.as_local(empty_at).date().isoformat()
 
-    # ------------------------------------------------------------------
-    # Stale overlay
-    # ------------------------------------------------------------------
+    def _build_household(
+        self,
+        batteries: dict[str, BatteryInfo],
+        previous: dict[str, BatteryInfo],
+    ) -> Household:
+        """Lifetimes and drain rates of all batteries, to learn from similar ones.
 
-    def _apply_stale_overlay(
-        self, batteries: dict[str, BatteryInfo]
-    ) -> None:
-        now = self._get_now_ts()
+        Lifetimes come from stored replacements, drain rates from the last
+        cycle's measured linear estimates (never from fallback estimates).
+        """
+        household = Household()
         for entity_id, info in batteries.items():
-            last_ts = (
-                self.store.get_last_seen_ts(entity_id)
-                or self.store.get_last_update_ts(entity_id)
+            household.add_replacements(
+                entity_id,
+                info.device_model,
+                self.store.get_category(entity_id) or info.category,
+                self.store.get_replacements(entity_id),
             )
-            median_iv = self.store.get_median_interval(entity_id)
-            was_stale = False
-            if self.data and entity_id in self.data.batteries:
-                was_stale = self.data.batteries[entity_id].stale
-            info.stale = check_stale(
-                last_update_ts=last_ts,
-                median_interval=median_iv,
-                value_is_unavailable=info.last_value is None,
-                now_ts=now,
-            )
-            if info.stale:
-                info.status = STATUS_CRITICAL
-            if info.stale != was_stale:
-                self._log_stale_change(entity_id, info)
-                self._prod_log_stale_change(entity_id, info)
-
-    # ------------------------------------------------------------------
-    # History integration
-    # ------------------------------------------------------------------
-
-    async def _seed_new_batteries(
-        self, batteries: dict[str, BatteryInfo]
-    ) -> None:
-        for entity_id, info in batteries.items():
-            if self.store.is_seeded(entity_id):
-                continue
-            try:
-                await async_seed_from_recorder(
-                    self.hass,
-                    self.store,
-                    entity_id,
-                    is_binary=info.is_binary,
+        for entity_id, info in previous.items():
+            if (
+                info.remaining_source == REMAINING_MEASURED
+                and info.category == CATEGORY_LINEAR
+                and isinstance(info.last_value, (int, float))
+                and info.remaining_days
+            ):
+                rate = self._average_drain_rate(entity_id) or (
+                    info.last_value / info.remaining_days
                 )
-            except Exception:
-                LOGGER.warning(
-                    "Failed to seed history for %s",
-                    entity_id,
-                    exc_info=True,
-                )
-                self.store.mark_seeded(entity_id)
+                household.rates.append((entity_id, info.device_model, rate))
+        return household
 
-    def _record_current_values(
-        self, batteries: dict[str, BatteryInfo]
-    ) -> None:
-        now = self._get_now_ts()
-        for entity_id, info in batteries.items():
-            if info.last_value is None:
-                continue
-            if info.is_binary:
-                val = 1.0 if info.last_value == STATE_ON else 0.0
-            elif isinstance(info.last_value, (int, float)):
-                val = float(info.last_value)
-            else:
-                continue
-            self.store.set_last_seen(entity_id, now)
-            raw = self.store.get_raw_points(entity_id)
-            if raw and raw[-1][1] == val:
-                continue
-            self.store.add_point(entity_id, now, val)
+    def _average_drain_rate(self, entity_id: str) -> float | None:
+        """pp per day since the current battery was inserted, if measurable.
 
-    def _update_confidence(
-        self, batteries: dict[str, BatteryInfo]
-    ) -> None:
-        now = self._get_now_ts()
-        for entity_id, info in batteries.items():
-            days = self.store.get_history_days(entity_id, now_ts=now)
-            if days < MIN_HISTORY_DAYS:
-                info.confidence = CONFIDENCE_DEFAULT
-            elif days < LOW_CONFIDENCE_DAYS:
-                info.confidence = CONFIDENCE_LOW
-            elif days < MEDIUM_CONFIDENCE_DAYS:
-                info.confidence = CONFIDENCE_MEDIUM
-            else:
-                info.confidence = CONFIDENCE_HIGH
-
-    def _maybe_aggregate(self) -> None:
-        now = self._get_now_ts()
-        agg_interval = 86400
-        if self._test_mode_active:
-            agg_interval /= self._time_factor
-        if now - self._last_aggregation > agg_interval:
-            self.store.aggregate(now_ts=now)
-            self._last_aggregation = now
+        A full battery of the same model is estimated from this, not from
+        the current slope: a peer whose drop speeds up towards the end
+        (common for coin cells) would make a fresh battery look empty in
+        weeks (IKEA remote: 48 days instead of ~600).
+        """
+        points = self.store.get_all_points(entity_id)
+        replacements = self.store.get_replacements(entity_id)
+        start = replacements[-1] if replacements else None
+        current = [p for p in points if start is None or p[0] >= start]
+        if len(current) < 2:
+            return None
+        days = (current[-1][0] - current[0][0]) / 86400
+        drop = current[0][1] - current[-1][1]
+        if days < SIMILAR_RATE_MIN_DAYS or drop < SIMILAR_RATE_MIN_DROP:
+            return None
+        return drop / days
 
     # ------------------------------------------------------------------
     # State-change listener
     # ------------------------------------------------------------------
 
     @callback
-    def _update_state_listeners(self, current_entities: set[str]) -> None:
-        if current_entities == self._tracked_entities:
+    def _update_state_listener(self, entity_ids: set[str]) -> None:
+        if entity_ids == self._tracked_entities:
             return
+        self._async_unsubscribe_state_listener()
+        if entity_ids:
+            self._unsub_state_listener = async_track_state_change_event(
+                self.hass, list(entity_ids), self._handle_battery_state_change
+            )
+        self._tracked_entities = entity_ids
 
+    @callback
+    def _async_unsubscribe_state_listener(self) -> None:
         if self._unsub_state_listener is not None:
             self._unsub_state_listener()
             self._unsub_state_listener = None
 
-        if current_entities:
-            self._unsub_state_listener = async_track_state_change_event(
-                self.hass,
-                list(current_entities),
-                self._handle_battery_state_change,
-            )
-            self.config_entry.async_on_unload(
-                lambda: (
-                    self._unsub_state_listener()
-                    if self._unsub_state_listener
-                    else None
-                )
-            )
-
-        self._tracked_entities = current_entities
-
     @callback
-    def _handle_battery_state_change(self, event: Event) -> None:
-        entity_id = event.data.get("entity_id")
-        new_state = event.data.get("new_state")
-        if entity_id is None or new_state is None or self.data is None:
+    def _handle_battery_state_change(
+        self, event: Event[EventStateChangedData]
+    ) -> None:
+        entity_id = event.data["entity_id"]
+        new_state = event.data["new_state"]
+        if new_state is None or self.data is None:
+            return
+        previous = self.data.batteries.get(entity_id)
+        if previous is None:
             return
 
-        if entity_id not in self.data.batteries:
+        info = self._build_battery_info(
+            new_state,
+            is_binary=previous.is_binary,
+            source_attr=previous.source_attr,
+        )
+        if info.last_value == previous.last_value and info.name == previous.name:
+            return  # attribute-only update, nothing new for the battery
+
+        info.category = previous.category
+        info.confidence = previous.confidence
+        info.device_model = previous.device_model
+        self._ingest(entity_id, info, self._get_now_ts())
+        self._evaluate(entity_id, info, previous)
+        self._log_event(
+            "state_change",
+            entity_id=entity_id,
+            old_state=_state_str(previous.last_value),
+            new_state=_state_str(info.last_value),
+            status=info.status,
+            category=info.category,
+            confidence=info.confidence,
+            stale=info.stale,
+            value=info.last_value,
+            remaining_days=info.remaining_days,
+            remaining_source=info.remaining_source,
+        )
+
+        self.data.batteries[entity_id] = info
+        # Not async_set_updated_data(): that would also restart the update
+        # interval, and frequent battery events would starve the periodic
+        # cycle (discovery, reclassification, stale detection, aggregation).
+        self.async_update_listeners()
+
+    # ------------------------------------------------------------------
+    # Event logs
+    # ------------------------------------------------------------------
+
+    def _init_logs(self) -> None:
+        log_dir = self.hass.config.path(PRODUCTION_LOG_DIR)
+        self._production_log = ProductionLog(log_dir)
+        LOGGER.info("Production log directory: %s", log_dir)
+        if self.developer_mode:
+            path = self.hass.config.path(DEBUG_LOG_FILE)
+            self._debug_log = DebugLog(path)
+            LOGGER.info("Debug log active: %s", path)
+        self._log_event(
+            "start",
+            options=dict(self.config_entry.options),
+            debug_extra={
+                "developer_mode": True,
+                "test_mode_active": self._test_mode_active,
+                "time_factor": self._time_factor,
+                "config_data": dict(self.config_entry.data),
+            },
+        )
+
+    def _log_event(
+        self,
+        event_type: str,
+        *,
+        production: bool = True,
+        debug_extra: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        """Write an event to the production log and (verbose) debug log."""
+        now = dt_util.utcnow().timestamp()
+        if production and self._production_log is not None:
+            self._production_log.log(
+                {"type": event_type, "ts": now, "iso": _iso(now), **fields}
+            )
+        if self._debug_log is not None:
+            self._debug_log.log(
+                {
+                    "type": event_type,
+                    "real_ts": now,
+                    "real_iso": _iso(now),
+                    "virtual_ts": self._get_now_ts(),
+                    **fields,
+                    **(debug_extra or {}),
+                }
+            )
+
+    def _log_update(self, data: BatteryBrainData) -> None:
+        """Snapshot of all batteries: hourly in production, every cycle in debug."""
+        real_now = dt_util.utcnow().timestamp()
+        production = real_now - self._last_snapshot_log >= PRODUCTION_SNAPSHOT_INTERVAL
+        if not production and self._debug_log is None:
             return
+        if production:
+            self._last_snapshot_log = real_now
 
-        existing = self.data.batteries[entity_id]
+        now = self._get_now_ts()
+        snapshot: dict[str, dict[str, Any]] = {}
+        debug_snapshot: dict[str, dict[str, Any]] = {}
+        for entity_id, info in data.batteries.items():
+            raw = self.store.get_raw_points(entity_id)
+            snapshot[entity_id] = {
+                "name": info.name,
+                "value": info.last_value,
+                "category": info.category,
+                "status": info.status,
+                "confidence": info.confidence,
+                "stale": info.stale,
+                "remaining_days": info.remaining_days,
+                "remaining_source": info.remaining_source,
+                "is_binary": info.is_binary,
+                "unit": info.unit,
+                "history_days": round(
+                    self.store.get_history_days(entity_id, now_ts=now), 2
+                ),
+                "raw_points_count": len(raw),
+                "daily_summaries_count": len(
+                    self.store.get_daily_summaries(entity_id)
+                ),
+            }
+            if self._debug_log is not None:
+                debug_snapshot[entity_id] = {
+                    **snapshot[entity_id],
+                    "median_interval_s": self.store.get_median_interval(entity_id),
+                    "last_update_ts": self.store.get_last_update_ts(entity_id),
+                    "recent_values": [p[1] for p in raw[-10:]],
+                }
 
-        if new_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            now = self._get_now_ts()
-            if existing.is_binary:
-                val = 1.0 if new_state.state == STATE_ON else 0.0
-            else:
-                try:
-                    val = float(new_state.state)
-                except (ValueError, TypeError):
-                    val = None
-            if val is not None:
-                self.store.set_last_seen(entity_id, now)
-                self.store.add_point(entity_id, now, val)
-
-        updated = self._build_battery_info(
-            entity_id,
-            new_state.state,
-            new_state.attributes,
-            is_binary=existing.is_binary,
+        self._log_event(
+            "update",
+            production=production,
+            update_interval_s=self.update_interval.total_seconds(),
+            sensors={
+                "normal": len(data.normal),
+                "warning": len(data.warning),
+                "critical": len(data.critical),
+                "total": len(data.batteries),
+            },
+            batteries=snapshot,
+            debug_extra={
+                "virtual_iso": _iso(now),
+                "test_mode": self._test_mode_active,
+                "time_factor": self._time_factor if self._test_mode_active else 1,
+                "batteries": debug_snapshot,
+            },
         )
-        updated.category = existing.category
-        updated.confidence = existing.confidence
-        updated.stale = existing.stale
 
-        binary_critical = self.config_entry.options.get(
-            OPT_BINARY_LOW_IS_CRITICAL, False
-        )
-        updated.status = self._derive_single_status(
-            entity_id, updated, binary_critical
-        )
-        self._estimate_single_remaining(entity_id, updated)
+    async def _async_flush_logs(self) -> None:
+        for log in (self._production_log, self._debug_log):
+            if log is not None:
+                await log.async_flush(self.hass)
 
-        old_state_obj = event.data.get("old_state")
-        old_state_str = old_state_obj.state if old_state_obj else None
-        self._log_state_change(
-            entity_id, old_state_str, new_state.state, updated
-        )
-        self._prod_log_state_change(
-            entity_id, old_state_str, new_state.state, updated
-        )
 
-        self.data.batteries[entity_id] = updated
-        self.async_set_updated_data(self.data)
+def _battery_level(info: BatteryInfo) -> float | None:
+    """The reading as a number: percent, volts, or 1.0/0.0 (binary low/normal).
+
+    Text levels ("low", "high", …) map to percent (TEXT_BATTERY_LEVELS).
+    """
+    value = info.last_value
+    if value is None:
+        return None
+    if info.is_binary:
+        return 1.0 if value == STATE_ON else 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return TEXT_BATTERY_LEVELS.get(str(value).strip().lower())
+
+
+def _alert_threshold(options: Mapping[str, Any]) -> float | None:
+    """The warning threshold in the threshold alert mode, else None."""
+    if options.get(OPT_ALERT_MODE, ALERT_MODE_SMART) != ALERT_MODE_THRESHOLD:
+        return None
+    return float(options.get(OPT_WARNING_THRESHOLD, DEFAULT_WARNING_THRESHOLD))
+
+
+def _is_text_low(info: BatteryInfo) -> bool:
+    """Whether the reading is a text low signal ("low", "critical", "empty")."""
+    value = info.last_value
+    return (
+        isinstance(value, str)
+        and not info.is_binary
+        and value.strip().lower() in TEXT_LOW_LEVELS
+    )
+
+
+def _try_float(value: Any) -> float | str | None:
+    """A number if possible, otherwise the raw value (e.g. "low") or None."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return str(value) or None
+
+
+def _state_str(value: float | str | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()

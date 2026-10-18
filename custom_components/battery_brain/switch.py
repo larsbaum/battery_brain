@@ -1,4 +1,4 @@
-"""Switch platform for BatteryBrain (developer test mode)."""
+"""Switch platform for BatteryBrain (developer mode: test mode)."""
 
 from __future__ import annotations
 
@@ -6,14 +6,13 @@ from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import BatteryBrainConfigEntry
 from .const import CONF_DEVELOPER_MODE, DOMAIN, TEST_MODE_TIME_FACTOR
 from .coordinator import BatteryBrainCoordinator
+from .entity import BatteryBrainEntity
 
 PARALLEL_UPDATES = 0
 
@@ -25,6 +24,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up BatteryBrain switch entities."""
     if not entry.options.get(CONF_DEVELOPER_MODE, False):
+        # Developer mode off: remove the entity left from a previous run.
         registry = er.async_get(hass)
         entity_id = registry.async_get_entity_id(
             "switch", DOMAIN, f"{DOMAIN}_test_mode"
@@ -32,27 +32,17 @@ async def async_setup_entry(
         if entity_id is not None:
             registry.async_remove(entity_id)
         return
-    coordinator = entry.runtime_data
-    async_add_entities([TestModeSwitch(coordinator)])
+    async_add_entities([TestModeSwitch(entry.runtime_data)])
 
 
-class TestModeSwitch(
-    CoordinatorEntity[BatteryBrainCoordinator], SwitchEntity
-):
+class TestModeSwitch(BatteryBrainEntity, SwitchEntity):
     """Switch to activate test mode with accelerated time."""
 
-    _attr_has_entity_name = True
     _attr_translation_key = "test_mode"
     _attr_icon = "mdi:fast-forward"
 
     def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_test_mode"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, coordinator.config_entry.entry_id)},
-            name="Battery Brain",
-            entry_type=DeviceEntryType.SERVICE,
-        )
+        super().__init__(coordinator, "switch", "test_mode")
 
     @property
     def is_on(self) -> bool:

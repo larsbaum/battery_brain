@@ -2,30 +2,36 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable
+from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
+from homeassistant.const import MATCH_ALL
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import BatteryBrainConfigEntry
-from .const import (
-    DOMAIN,
-    STATUS_CRITICAL,
-    STATUS_NORMAL,
-    STATUS_WARNING,
-)
 from .coordinator import BatteryBrainCoordinator, BatteryBrainData, BatteryInfo
+from .entity import BatteryBrainEntity
 
 PARALLEL_UPDATES = 0
 
 
-def _battery_attrs(batteries: Iterable[BatteryInfo]) -> dict[str, dict]:
-    """Per-battery detail dict exposed as extra state attributes."""
+def _battery_attrs(batteries: Iterable[BatteryInfo]) -> dict[str, dict[str, Any]]:
+    """Per-battery detail dicts, keyed by the battery's name.
+
+    Batteries that share a name are keyed "Name (entity_id)" so that one
+    doesn't overwrite the other.
+    """
+    batteries = list(batteries)
+    name_count = Counter(info.name for info in batteries)
     return {
-        info.name: {
+        (
+            info.name
+            if name_count[info.name] == 1
+            else f"{info.name} ({info.source_entity})"
+        ): {
             "category": info.category,
             "status": info.status,
             "last_value": info.last_value,
@@ -33,6 +39,7 @@ def _battery_attrs(batteries: Iterable[BatteryInfo]) -> dict[str, dict]:
             "stale": info.stale,
             "remaining_days": info.remaining_days,
             "estimated_empty": info.estimated_empty,
+            "remaining_source": info.remaining_source,
             "source_entity": info.source_entity,
         }
         for info in batteries
@@ -48,107 +55,56 @@ async def async_setup_entry(
     coordinator = entry.runtime_data
     async_add_entities(
         [
-            BatteriesNormalSensor(coordinator),
-            BatteriesWarningSensor(coordinator),
-            BatteriesCriticalSensor(coordinator),
-            AllBatteriesSensor(coordinator),
+            BatteryBrainSensor(
+                coordinator, "batteries_normal", "mdi:battery-check", lambda d: d.normal
+            ),
+            BatteryBrainSensor(
+                coordinator, "batteries_warning", "mdi:battery-alert", lambda d: d.warning
+            ),
+            BatteryBrainSensor(
+                coordinator,
+                "batteries_critical",
+                "mdi:battery-alert-variant",
+                lambda d: d.critical,
+            ),
+            BatteryBrainSensor(
+                coordinator,
+                "all_batteries",
+                "mdi:battery-heart-variant",
+                lambda d: list(d.batteries.values()),
+            ),
         ]
     )
 
 
-class BatteryBrainSensor(CoordinatorEntity[BatteryBrainCoordinator], SensorEntity):
-    """Base class for BatteryBrain sensors."""
+class BatteryBrainSensor(BatteryBrainEntity, SensorEntity):
+    """Number of batteries in a group, with per-battery detail attributes."""
 
-    _attr_has_entity_name = True
+    # The per-battery details can be large and change with every battery
+    # reading; recording them would bloat the database (and exceed HA's
+    # 16 KB attribute limit with many batteries). Live values are unaffected.
+    _unrecorded_attributes = frozenset({MATCH_ALL})
 
-    def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
-        super().__init__(coordinator)
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, coordinator.config_entry.entry_id)},
-            name="Battery Brain",
-            entry_type=DeviceEntryType.SERVICE,
-        )
+    def __init__(
+        self,
+        coordinator: BatteryBrainCoordinator,
+        key: str,
+        icon: str,
+        select: Callable[[BatteryBrainData], list[BatteryInfo]],
+    ) -> None:
+        super().__init__(coordinator, "sensor", key)
+        self._attr_translation_key = key
+        self._attr_icon = icon
+        self._select = select
 
     @property
     def available(self) -> bool:
         return self.coordinator.startup_complete and super().available
 
     @property
-    def _data(self) -> BatteryBrainData:
-        return self.coordinator.data
-
-
-class BatteriesNormalSensor(BatteryBrainSensor):
-    """Number of batteries in normal status."""
-
-    _attr_translation_key = "batteries_normal"
-    _attr_icon = "mdi:battery-check"
-
-    def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_batteries_normal"
-
-    @property
     def native_value(self) -> int:
-        return len(self._data.normal)
+        return len(self._select(self.coordinator.data))
 
     @property
-    def extra_state_attributes(self) -> dict[str, dict]:
-        return _battery_attrs(self._data.normal)
-
-
-class BatteriesWarningSensor(BatteryBrainSensor):
-    """Number of batteries in warning status."""
-
-    _attr_translation_key = "batteries_warning"
-    _attr_icon = "mdi:battery-alert"
-
-    def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_batteries_warning"
-
-    @property
-    def native_value(self) -> int:
-        return len(self._data.warning)
-
-    @property
-    def extra_state_attributes(self) -> dict[str, dict]:
-        return _battery_attrs(self._data.warning)
-
-
-class BatteriesCriticalSensor(BatteryBrainSensor):
-    """Number of batteries in critical status."""
-
-    _attr_translation_key = "batteries_critical"
-    _attr_icon = "mdi:battery-alert-variant"
-
-    def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_batteries_critical"
-
-    @property
-    def native_value(self) -> int:
-        return len(self._data.critical)
-
-    @property
-    def extra_state_attributes(self) -> dict[str, dict]:
-        return _battery_attrs(self._data.critical)
-
-
-class AllBatteriesSensor(BatteryBrainSensor):
-    """Total number of monitored batteries with per-battery detail attributes."""
-
-    _attr_translation_key = "all_batteries"
-    _attr_icon = "mdi:battery-heart-variant"
-
-    def __init__(self, coordinator: BatteryBrainCoordinator) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{DOMAIN}_all_batteries"
-
-    @property
-    def native_value(self) -> int:
-        return len(self._data.batteries)
-
-    @property
-    def extra_state_attributes(self) -> dict[str, dict]:
-        return _battery_attrs(self._data.batteries.values())
+    def extra_state_attributes(self) -> dict[str, dict[str, Any]]:
+        return _battery_attrs(self._select(self.coordinator.data))

@@ -11,6 +11,17 @@ und dem zugehörigen Git-Tag übereinstimmen.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-21
+
+### Fixed
+- **Kein falscher „Kritisch“-Alarm mehr direkt nach dem Batteriewechsel.**
+  Bei Spannungssensoren (z. B. Aqara-Schalter in mV) zählten für die
+  Glättung der letzten 36 Stunden noch die Werte der alten Batterie, während
+  die Skala schon zur neuen passte: Die frische Batterie stand bis zu
+  anderthalb Tage auf „Kritisch“. Prozent-Batterien blieben im
+  Schwellenwert-Modus nach dem Wechsel aus demselben Grund noch bis zu einen
+  Tag „Kritisch“. Jetzt zählen nur noch Werte der aktuellen Batterie.
+
 ## [1.0.0] - 2026-10-18
 
 Erste stabile Version. Das Update braucht keinen Eingriff: Einstellungen,
@@ -358,7 +369,8 @@ Entities (inkl. Entity-IDs) und die gesammelte Historie bleiben erhalten.
   Debug-Logging; Always-on Production-Logging (JSONL, 30 Tage Retention).
 - Einzelne Entities ausschließen (`OPT_EXCLUDE_ENTITIES`).
 
-[Unreleased]: https://github.com/larsbaum/battery_brain/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/larsbaum/battery_brain/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/larsbaum/battery_brain/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/larsbaum/battery_brain/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/larsbaum/battery_brain/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/larsbaum/battery_brain/compare/v0.1.3...v0.1.4

@@ -541,6 +541,13 @@ def _current_battery_start(points: list[list[float]], now: float) -> float:
     return confirmed[-1] if confirmed else points[0][0]
 
 
+def _battery_start_ts(
+    points: list[list[float]], now_ts: float | None
+) -> float | None:
+    """Start of the current battery (percent readings); None without points."""
+    return _current_battery_start(points, _now(now_ts)) if points else None
+
+
 def _split_at_replacements(
     values: list[float], threshold: float = 20.0
 ) -> list[list[float]]:
@@ -610,7 +617,12 @@ def derive_status(
         return _status_low_stable(current_value, values, raw_points, now_ts=now_ts)
     if category == CATEGORY_VOLTAGE:
         return _status_voltage(
-            current_value, values, raw_points, now_ts=now_ts, unit=unit
+            current_value,
+            values,
+            raw_points,
+            now_ts=now_ts,
+            unit=unit,
+            all_points=all_points,
         )
     if category == CATEGORY_RECHARGEABLE:
         return _status_rechargeable(current_value, raw_points, now_ts=now_ts)
@@ -641,7 +653,12 @@ def _status_threshold(
         if category == CATEGORY_RECHARGEABLE:
             level = value
         else:
-            level = _representative_recent_value(value, raw_points, now_ts=now_ts)
+            level = _representative_recent_value(
+                value,
+                raw_points,
+                now_ts=now_ts,
+                since_ts=_battery_start_ts(raw_points, now_ts),
+            )
         if level <= threshold / 2:
             status = STATUS_CRITICAL
             if category == CATEGORY_RECHARGEABLE and _recently_recharged(
@@ -781,7 +798,10 @@ def _status_low_stable(
         return STATUS_NORMAL
 
     representative = _representative_recent_value(
-        value, raw_points or [], now_ts=now_ts
+        value,
+        raw_points or [],
+        now_ts=now_ts,
+        since_ts=_battery_start_ts(raw_points or [], now_ts),
     )
 
     sorted_vals = sorted(values)
@@ -806,27 +826,33 @@ def _status_voltage(
     *,
     now_ts: float | None = None,
     unit: str | None = None,
+    all_points: list[list[float]] | None = None,
 ) -> str:
     """Charge level between the battery's full and empty voltage.
 
     Relative to the observed min/max instead, a battery that was never
     replaced sits at its own minimum all the time and would be pegged at
-    critical (or flap with daily temperature swings).
+    critical (or flap with daily temperature swings). *all_points* (the
+    [ts, value] pairs of *values*) limits the smoothing to the current
+    battery, the one *full* and *empty* refer to.
     """
     if not _is_number(value) or len(values) < 3:
         return STATUS_NORMAL
 
     tol = _voltage_rise_tol(values)
-    cleaned = [v for _, v in _despike(list(enumerate(values)), tol)]
-    _, full, empty = _voltage_reference(cleaned, unit)
+    kept = _despike(list(enumerate(values)), tol)
+    start, full, empty = _voltage_reference([v for _, v in kept], unit)
     span = full - empty
     # Full barely above empty: the empty reference doesn't fit this device
     # (or the readings are pure noise) — no meaningful charge level.
     if span < _voltage_min_range(full, unit):
         return STATUS_NORMAL
 
+    since_ts = None
+    if all_points and len(all_points) == len(values):
+        since_ts = all_points[kept[start][0]][0]
     representative = _representative_recent_value(
-        value, raw_points, now_ts=now_ts
+        value, raw_points, now_ts=now_ts, since_ts=since_ts
     )
     pct = (representative - empty) / span * 100
     warning_pct, critical_pct = DEFAULT_THRESHOLDS[CATEGORY_VOLTAGE]
@@ -892,7 +918,10 @@ def _status_unknown_default(
         return STATUS_NORMAL
 
     representative = _representative_recent_value(
-        value, raw_points or [], now_ts=now_ts
+        value,
+        raw_points or [],
+        now_ts=now_ts,
+        since_ts=_battery_start_ts(raw_points or [], now_ts),
     )
 
     warning_pct, critical_pct = DEFAULT_THRESHOLDS[CATEGORY_UNKNOWN_DEFAULT]
@@ -910,6 +939,7 @@ def _representative_recent_value(
     window_hours: float = NOISE_SMOOTHING_WINDOW_HOURS,
     percentile: float = NOISE_SMOOTHING_PERCENTILE,
     now_ts: float | None = None,
+    since_ts: float | None = None,
 ) -> float:
     """A noise-robust stand-in for *current_value* for threshold comparisons.
 
@@ -919,11 +949,18 @@ def _representative_recent_value(
     on its own, while a genuine sustained decline still pulls this value
     down over time. Falls back to *current_value* when there isn't enough
     recent history to smooth over.
+
+    Points before *since_ts* (start of the current battery) don't count:
+    right after a replacement the old battery's readings would fill the
+    window (real Opple switch: 2895 mV for hours after the new battery
+    reported 3271 mV → critical).
     """
     if len(raw_points) < NOISE_SMOOTHING_MIN_POINTS:
         return current_value
 
     cutoff = _now(now_ts) - window_hours * _HOUR
+    if since_ts is not None:
+        cutoff = max(cutoff, since_ts)
     window = [p[1] for p in raw_points if p[0] >= cutoff and p[1] is not None]
 
     if len(window) < NOISE_SMOOTHING_MIN_POINTS:

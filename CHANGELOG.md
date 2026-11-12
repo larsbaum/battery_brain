@@ -11,6 +11,18 @@ und dem zugehörigen Git-Tag übereinstimmen.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-12
+
+### Fixed
+- **Kein falscher „Kritisch“-Alarm mehr für Batterien, die dauerhaft auf
+  einem niedrigen Wert stehen.** Ein Außensensor, der seit Monaten 0 %
+  meldet und trotzdem zuverlässig funktioniert, wurde nach einigen sehr
+  kurzen Ausschlägen (wenige Minuten auf ~20 %) als „entlädt sich noch“
+  eingestuft und stand dann bis zu zwei Wochen auf „Kritisch“ mit
+  Restlaufzeit „heute“. Ursache: Zeiträume ohne Wertänderung wurden bei der
+  Trendprüfung wie ein langsamer Anstieg behandelt. Jetzt gilt ein Wert
+  unverändert bis zur nächsten Meldung.
+
 ## [1.0.1] - 2026-10-21
 
 ### Fixed
@@ -369,7 +381,8 @@ Entities (inkl. Entity-IDs) und die gesammelte Historie bleiben erhalten.
   Debug-Logging; Always-on Production-Logging (JSONL, 30 Tage Retention).
 - Einzelne Entities ausschließen (`OPT_EXCLUDE_ENTITIES`).
 
-[Unreleased]: https://github.com/larsbaum/battery_brain/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/larsbaum/battery_brain/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/larsbaum/battery_brain/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/larsbaum/battery_brain/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/larsbaum/battery_brain/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/larsbaum/battery_brain/compare/v0.1.4...v0.2.0

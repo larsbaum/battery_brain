@@ -387,6 +387,12 @@ def _still_draining(
     LOW_STABLE_TREND_DAYS — a battery sitting at 1 % for weeks has, a
     draining one at 26 % hasn't. A clear trend is required (r²), so noise
     of a battery stuck low doesn't count as draining.
+
+    Readings hold until the next one (no interpolation): points are only
+    stored on change, so a gap means "unchanged". Interpolating across it
+    turned a sensor stuck at 0 % for 11 days, followed by a 4-minute spike
+    to 23 %, into an 11-day ramp up and a steep "decline" afterwards (real
+    outdoor sensor: unknown_default + critical for two weeks).
     """
     if not points:
         return False
@@ -395,7 +401,7 @@ def _still_draining(
     start = now - LOW_STABLE_TREND_DAYS * _DAY
     before = [p for p in pts if p[0] < start]
     window = before[-1:] + [p for p in pts if p[0] >= start]
-    trend = _fit_trend(_resample(window, now, _DAY, start_ts=start), now)
+    trend = _fit_trend(_resample(window, now, _DAY, start_ts=start, hold=True), now)
     if trend is None:
         return False
     return (
@@ -1322,10 +1328,12 @@ def _resample(
     bucket_s: float,
     *,
     start_ts: float | None = None,
+    hold: bool = False,
 ) -> list[Bucket]:
     """Time-weighted bucket means of the readings as a continuous curve.
 
-    Readings are interpolated linearly; the last one holds until *end_ts*.
+    Readings are interpolated linearly (with *hold*, each one holds until
+    the next, a step curve); the last one holds until *end_ts*.
     Change-only readings and hourly imported history thus weigh the same,
     a slow integer sensor's steps become the underlying slope, and time
     since the last change counts as "no drain". Buckets end at *end_ts*,
@@ -1337,7 +1345,11 @@ def _resample(
     for i, (ts, value) in enumerate(points):
         if i + 1 < len(points):
             next_ts, next_value = points[i + 1]
-            rate = (next_value - value) / (next_ts - ts) if next_ts > ts else 0.0
+            rate = (
+                (next_value - value) / (next_ts - ts)
+                if next_ts > ts and not hold
+                else 0.0
+            )
         else:
             next_ts, rate = end_ts, 0.0
         seg_end = min(next_ts, end_ts)
